@@ -60,7 +60,9 @@ class KVCacheManager:
         )
 
         # 记录每一层当前的sequence length
-        self.seq_lens = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
+        self.seq_lens = torch.zeros(
+            max_batch_size, num_layers, dtype=torch.int32, device=device
+        )
 
         logger.info(
             f"KVCacheManager initialized: {num_layers} layers, "
@@ -83,7 +85,7 @@ class KVCacheManager:
             完整的key和value: [batch_size, num_kv_heads, total_seq_len, head_dim]
         """
         batch_size, num_heads, seq_len, head_dim = key_states.shape
-        current_len = self.seq_lens[batch_idx].item()
+        current_len = self.seq_lens[batch_idx][layer_idx].item()
 
         # 写入新的KV到cache
         self.cache[
@@ -95,7 +97,7 @@ class KVCacheManager:
 
         # 更新sequence length
         new_len = current_len + seq_len
-        self.seq_lens[batch_idx] = new_len
+        self.seq_lens[batch_idx][layer_idx] = new_len
 
         # 返回完整的KV (从0到new_len)
         full_key = self.cache[layer_idx, 0, batch_idx : batch_idx + 1, :, :new_len, :]
@@ -107,28 +109,24 @@ class KVCacheManager:
         self, layer_idx: int, batch_idx: int = 0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        获取指定层的完整KV cache
-
         Returns:
             key, value: [1, num_kv_heads, seq_len, head_dim]
         """
-        seq_len = self.seq_lens[batch_idx].item()
+        seq_len = self.seq_lens[batch_idx][layer_idx].item()
         key = self.cache[layer_idx, 0, batch_idx : batch_idx + 1, :, :seq_len, :]
         value = self.cache[layer_idx, 1, batch_idx : batch_idx + 1, :, :seq_len, :]
         return key, value
 
     def clear(self, batch_idx: Optional[int] = None):
-        """清空cache"""
         if batch_idx is not None:
-            self.seq_lens[batch_idx] = 0
+            # self.seq_lens[batch_idx] = 0
             self.cache[:, :, batch_idx, :, :, :] = 0
         else:
             self.seq_lens[:] = 0
             self.cache[:] = 0
 
-    def get_seq_len(self, batch_idx: int = 0) -> int:
-        """获取当前序列长度"""
-        return self.seq_lens[batch_idx].item()
+    def get_seq_len(self, batch_idx: int = 0, layer_idx: int = 0) -> int:
+        return self.seq_lens[batch_idx][layer_idx].item()
 
 
 class Qwen3Inference:
@@ -177,7 +175,7 @@ class Qwen3Inference:
             f"hidden_size={self.hidden_size}"
         )
 
-    def apply_rotary_emb(self, q, k, cos, sin, position_ids, unsqueeze_dim=1):
+    def apply_rotary_emb(self, q, k, cos, sin, unsqueeze_dim=1):
         """
         Args:
             q: [batch_size, num_heads, seq_len, head_dim]
@@ -203,7 +201,6 @@ class Qwen3Inference:
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        layer_idx: int,
         is_prefill: bool = False,
     ) -> torch.Tensor:
         """
@@ -218,7 +215,7 @@ class Qwen3Inference:
         _, num_kv_heads, seq_len_k, _ = key.shape
 
         # FlashInfer 格式转换
-        q = query.squeeze(0)  # [num_heads, seq_len_q, head_dim]
+        q = query.squeeze(0).transpose(0, 1)  # [seq_len_q, num_heads, head_dim]
         k = key.squeeze(0)  # [num_kv_heads, seq_len_k, head_dim]
         v = value.squeeze(0)  # [num_kv_heads, seq_len_k, head_dim]
 
@@ -228,13 +225,13 @@ class Qwen3Inference:
                 k=k,
                 v=v,
                 kv_layout="HND",
+                causal=True,
             )
-            # output: [seq_len_q, num_heads, head_dim]
-            # 转换回: [batch, num_heads, seq_len_q, head_dim]
+            # output: [batch, seq_len_q, num_heads, head_dim]
             output = output.unsqueeze(0)
         else:
             # # Decode: q需要是 [num_qo_heads, head_dim] (无seq_len维度！)
-            q = q.squeeze(1).contiguous()  # [num_heads, head_dim]
+            q = q.squeeze(0)
 
             output = single_decode_with_kv_cache(
                 q=q,
@@ -284,16 +281,17 @@ class Qwen3Inference:
         value_states = attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         # value_states: [batch, num_kv_heads, seq_len, head_dim]
 
-        kv_seq_len = self.kv_cache.get_seq_len() + seq_len
+        # Before Checked
+        kv_seq_len = self.kv_cache.get_seq_len(layer_idx=layer_idx) + seq_len
         position_ids = torch.arange(
             kv_seq_len - seq_len,
             kv_seq_len,
             dtype=torch.long,
             device=hidden_states.device,
         ).unsqueeze(0)
-        cos, sin = self.model.model.rotary_emb(value_states, position_ids)
+        cos, sin = self.model.model.rotary_emb(hidden_states, position_ids)
         query_states, key_states = self.apply_rotary_emb(
-            query_states, key_states, cos, sin, position_ids
+            query_states, key_states, cos, sin
         )
 
         # 更新KV cache并获取完整的KV
@@ -306,19 +304,16 @@ class Qwen3Inference:
             query_states,
             key_cache,
             value_cache,
-            layer_idx,
             is_prefill=is_prefill,
         )
 
-        # Reshape back: [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, hidden]
-        attn_output = attn_output.transpose(1, 2).contiguous()
+        # Reshape back: [batch,  seq_len, num_heads, head_dim] -> [batch, seq_len, hidden]
         attn_output = attn_output.view(
             batch_size, seq_len, self.num_attention_heads * self.head_dim
         )
 
         # Output projection
         attn_output = attn.o_proj(attn_output)
-        # attn_output = F.linear(attn_output, attn.o_proj.weight)
 
         # Residual connection
         hidden_states = residual + attn_output
@@ -336,6 +331,7 @@ class Qwen3Inference:
         logger.info(f"Prefill: processing {seq_len} tokens")
 
         with torch.no_grad():
+            # checked
             hidden_states = self.model.model.embed_tokens(input_ids)
 
             for layer_idx in range(self.num_layers):
@@ -350,11 +346,8 @@ class Qwen3Inference:
 
     def decode_step(self, token_id: torch.Tensor) -> torch.Tensor:
         """
-        Decode阶段: 生成下一个token
-
         Args:
             token_id: [batch_size, 1] - 当前token
-
         Returns:
             logits: [batch_size, 1, vocab_size]
         """
@@ -387,23 +380,25 @@ class Qwen3Inference:
         Args:
             logits: [batch_size, vocab_size]
             temperature: 温度参数
-            top_p: nucleus sampling参数
-            top_k: top-k sampling参数
-
+                - T > 1: 分布更平滑，结果更随机
+                - T < 1: 分布更尖锐，结果更确定
+                - T = 0: 贪婪解码 (Greedy Decoding)
+            top_p: 仅保留累积概率达到 p 的 token 集合
+            top_k: 仅保留概率最高的 k 个 token
         Returns:
             token: [batch_size]
         """
-        # Temperature scaling
-        if temperature != 1.0:
-            logits = logits / temperature
+        if temperature == 0:
+            return torch.argmax(logits, dim=-1, keepdim=True)
 
-        # Top-k filtering
-        if top_k > 0:
-            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-            logits[indices_to_remove] = float("-inf")
+        logits = logits / temperature
 
-        # Top-p (nucleus) filtering
-        if top_p < 1.0:
+        if top_k is not None and top_k > 0:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            pivot = v[:, -1].unsqueeze(1)
+            logits[logits < pivot] = float("-Inf")
+
+        if top_p is not None and top_p < 1.0:
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
 
@@ -537,7 +532,7 @@ def main():
     engine = Qwen3Inference(config)
 
     # 测试prompt
-    prompt = "人工智能的未来发展方向是"
+    prompt = "hello"
 
     logger.info("\n" + "=" * 70)
     logger.info("Starting Generation")
