@@ -119,7 +119,7 @@ class KVCacheManager:
 
     def clear(self, batch_idx: Optional[int] = None):
         if batch_idx is not None:
-            # self.seq_lens[batch_idx] = 0
+            self.seq_lens[batch_idx] = 0
             self.cache[:, :, batch_idx, :, :, :] = 0
         else:
             self.seq_lens[:] = 0
