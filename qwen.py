@@ -232,6 +232,8 @@ class Qwen3Inference:
         else:
             # # Decode: q需要是 [num_qo_heads, head_dim] (无seq_len维度！)
             q = q.squeeze(0)
+            k = k.contiguous()
+            v = v
 
             output = single_decode_with_kv_cache(
                 q=q,
