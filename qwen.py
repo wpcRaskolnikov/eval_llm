@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from flashinfer import single_decode_with_kv_cache, single_prefill_with_kv_cache
 from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen3Config
 
-from kv_cache import KVCacheManager
+from kv_offload import GPUKVCache
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -57,7 +57,7 @@ class Qwen3Inference:
         self.hidden_size = model_config.hidden_size
         self.vocab_size = model_config.vocab_size
 
-        self.kv_cache = KVCacheManager(
+        self.kv_cache = GPUKVCache(
             num_layers=self.num_layers,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
@@ -422,7 +422,6 @@ class Qwen3Inference:
 
 
 def main():
-    """示例用法"""
     # 配置
     config = Qwen3InferenceConfig(
         model_path="/home/wpc/huggingface/Qwen3-8B",
