@@ -170,7 +170,7 @@ class GPUKVCache:
                     decode时  [batch, num_heads, 1, head_dim]
             lse: Optional[torch.Tensor]
         """
-        key, value = self.get(layer_idx, batch_idx)
+        key, value, _ = self.get_valid_kv(layer_idx, batch_idx)
         # key/value: [1, num_kv_heads, seq_len_k, head_dim]
 
         # FlashInfer 格式转换
@@ -205,6 +205,9 @@ class GPUKVCache:
             # output: [num_heads, head_dim]
             output = output.unsqueeze(0).unsqueeze(2)
             # output: [1, num_heads, 1, head_dim]
+            if lse is not None:
+                lse = lse.unsqueeze(0).unsqueeze(-1)
+                # lse: [num_heads] → [1, num_heads, 1]
 
         return output, lse
 
