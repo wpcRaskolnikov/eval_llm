@@ -96,57 +96,6 @@ class Qwen3Inference:
         k_embed = (k * cos) + (rotate_half(k) * sin)
         return q_embed, k_embed
 
-    def _compute_attention(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        is_prefill: bool = False,
-    ) -> torch.Tensor:
-        """
-        Args:
-            query: [batch_size, num_heads, seq_len_q, head_dim]
-            key: [batch_size, num_kv_heads, seq_len_k, head_dim]
-            value: [batch_size, num_kv_heads, seq_len_k, head_dim]
-        Returns:
-            output: [batch_size, num_heads, seq_len_q, head_dim]
-        """
-        batch_size, num_heads, seq_len_q, head_dim = query.shape
-        _, num_kv_heads, seq_len_k, _ = key.shape
-
-        # FlashInfer 格式转换
-        q = query.squeeze(0).transpose(0, 1)  # [seq_len_q, num_heads, head_dim]
-        k = key.squeeze(0)  # [num_kv_heads, seq_len_k, head_dim]
-        v = value.squeeze(0)  # [num_kv_heads, seq_len_k, head_dim]
-
-        if is_prefill:
-            output = single_prefill_with_kv_cache(
-                q=q,
-                k=k,
-                v=v,
-                kv_layout="HND",
-                causal=True,
-            )
-            # output: [batch, seq_len_q, num_heads, head_dim]
-            output = output.unsqueeze(0)
-        else:
-            # # Decode: q需要是 [num_qo_heads, head_dim] (无seq_len维度！)
-            q = q.squeeze(0)
-            k = k.contiguous()
-            v = v.contiguous()
-
-            output = single_decode_with_kv_cache(
-                q=q,
-                k=k,
-                v=v,
-                kv_layout="HND",
-            )
-            # output: [num_heads, head_dim]
-            # 转换回: [batch, num_heads, 1, head_dim]
-            output = output.unsqueeze(0).unsqueeze(2)
-
-        return output
-
     def _forward_layer(
         self,
         hidden_states: torch.Tensor,
@@ -196,16 +145,13 @@ class Qwen3Inference:
             query_states, key_states, cos, sin
         )
 
-        # 更新KV cache并获取完整的KV
-        key_cache, value_cache = self.kv_cache.update(
-            layer_idx, key_states, value_states
-        )
+        # 更新KV cache
+        self.kv_cache.update(layer_idx, key_states, value_states)
 
         # 计算attention
-        attn_output = self._compute_attention(
+        attn_output, _ = self.kv_cache.compute_attention(
+            layer_idx,
             query_states,
-            key_cache,
-            value_cache,
             is_prefill=is_prefill,
         )
 

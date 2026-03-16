@@ -2,7 +2,7 @@ import logging
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
+from flashinfer import single_decode_with_kv_cache, single_prefill_with_kv_cache
 
 logger = logging.getLogger(__name__)
 
@@ -154,71 +154,59 @@ class GPUKVCache:
         self,
         layer_idx: int,
         query: torch.Tensor,
-        num_q_heads: int,
+        is_prefill: bool = False,
         batch_idx: int = 0,
-        return_lse: bool = True,
+        return_lse: bool = False,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        计算GPU上有效KV的局部attention
         Args:
-            query: [batch_size, num_q_heads, 1, head_dim] decode时的query
-            num_q_heads: query heads数量（可能和kv_heads不同，GQA）
+            layer_idx: 层索引
+            query: [batch_size, num_heads, seq_len_q, head_dim]
+            is_prefill: 是否为prefill阶段
+            batch_idx: batch索引
             return_lse: 是否返回LSE用于后续合并
         Returns:
-            output: [batch_size, num_q_heads, 1, head_dim]
-            lse: [batch_size, num_q_heads, 1] 如果return_lse=True
+            output: prefill时 [batch, seq_len_q, num_heads, head_dim],
+                    decode时  [batch, num_heads, 1, head_dim]
+            lse: Optional[torch.Tensor]
         """
-        # 获取GPU上有效的KV
-        key, value, valid_indices = self.get_valid_kv(layer_idx, batch_idx)
-        # key/value: [1, num_kv_heads, valid_len, head_dim]
+        key, value = self.get(layer_idx, batch_idx)
+        # key/value: [1, num_kv_heads, seq_len_k, head_dim]
 
-        if key.size(2) == 0:  # 没有有效的KV
-            batch_size = query.size(0)
-            output = torch.zeros_like(query)
-            if return_lse:
-                lse = torch.full(
-                    (batch_size, num_q_heads, 1),
-                    float("-inf"),
-                    dtype=torch.float32,
-                    device=query.device,
-                )
-                return output, lse
-            return output, None
+        # FlashInfer 格式转换
+        q = query.squeeze(0).transpose(0, 1)  # [seq_len_q, num_heads, head_dim]
+        k = key.squeeze(0)  # [num_kv_heads, seq_len_k, head_dim]
+        v = value.squeeze(0)  # [num_kv_heads, seq_len_k, head_dim]
 
-        # GQA: 扩展KV heads到匹配query heads
-        num_kv_heads = key.size(1)
-        if num_q_heads != num_kv_heads:
-            # Repeat KV heads
-            n_rep = num_q_heads // num_kv_heads
-            key = key.repeat(1, n_rep, 1, 1)  # [1, num_q_heads, valid_len, head_dim]
-            value = value.repeat(1, n_rep, 1, 1)
-
-        # 计算attention: Q @ K^T / sqrt(d)
-        # query: [1, num_q_heads, 1, head_dim]
-        # key: [1, num_q_heads, valid_len, head_dim]
-        scale = 1.0 / (self.head_dim**0.5)
-
-        # [1, num_q_heads, 1, valid_len]
-        attn_weights = torch.matmul(query, key.transpose(-2, -1)) * scale
-
-        # 计算LSE (log-sum-exp) 用于后续合并
         lse = None
-        if return_lse:
-            # LSE = max + log(sum(exp(x - max)))
-            max_score = torch.max(attn_weights, dim=-1, keepdim=True)[
-                0
-            ]  # [1, heads, 1, 1]
-            lse = max_score.squeeze(-1) + torch.log(
-                torch.sum(torch.exp(attn_weights - max_score), dim=-1, keepdim=True)
-            ).squeeze(-1)  # [1, heads, 1]
+        if is_prefill:
+            if return_lse:
+                output, lse = single_prefill_with_kv_cache(
+                    q=q, k=k, v=v, kv_layout="HND", causal=True, return_lse=True
+                )
+            else:
+                output = single_prefill_with_kv_cache(
+                    q=q, k=k, v=v, kv_layout="HND", causal=True
+                )
+            # output: [seq_len_q, num_heads, head_dim]
+            output = output.unsqueeze(0)
+            # output: [1, seq_len_q, num_heads, head_dim]
+        else:
+            # Decode: q 需要是 [num_heads, head_dim]（无seq_len维度）
+            q = q.squeeze(0)
+            k = k.contiguous()
+            v = v.contiguous()
+            if return_lse:
+                output, lse = single_decode_with_kv_cache(
+                    q=q, k=k, v=v, kv_layout="HND", return_lse=True
+                )
+            else:
+                output = single_decode_with_kv_cache(q=q, k=k, v=v, kv_layout="HND")
+            # output: [num_heads, head_dim]
+            output = output.unsqueeze(0).unsqueeze(2)
+            # output: [1, num_heads, 1, head_dim]
 
-        # Softmax + 乘以value
-        attn_weights = F.softmax(attn_weights, dim=-1)  # [1, num_q_heads, 1, valid_len]
-        output = torch.matmul(attn_weights, value)  # [1, num_q_heads, 1, head_dim]
-
-        if return_lse:
-            return output, lse
-        return output, None
+        return output, lse
 
     def clear(self, batch_idx: Optional[int] = None):
         if batch_idx is not None:
