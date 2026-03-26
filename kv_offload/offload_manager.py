@@ -212,9 +212,13 @@ class HybridKVCacheManager:
     ) -> torch.Tensor:
         """
         Decode阶段：计算hybrid attention
+        - GPU 对未被 offload 的 KV 做 attention（由 FlashInfer 加速）
+        - CPU 对每个 KV head 独立检索 top-k token，计算 per-head attention
+        - 通过 LSE 方法将两部分结果合并（数值稳定）
+
         Args:
             query: [batch_size, num_q_heads, 1, head_dim]
-            num_q_heads: query heads数量（可能和kv_heads不同，GQA）
+            num_q_heads: query heads数量（GQA时 > num_kv_heads）
         Returns:
             output: [batch_size, num_q_heads, 1, head_dim]
         """
@@ -228,40 +232,36 @@ class HybridKVCacheManager:
             )
             return output
 
-        # 1. GPU端计算（使用未offload的KV）
+        # 1. GPU端：对剩余未offload的KV做attention，同时取LSE用于后续合并
         o_gpu, lse_gpu = self.gpu_cache.compute_attention(
             layer_idx=layer_idx,
             query=query,
             batch_idx=batch_idx,
             return_lse=True,
         )
+        # o_gpu:   [1, num_q_heads, 1, head_dim]
+        # lse_gpu: [1, num_q_heads, 1]
 
-        # 2. CPU端检索和计算
-        cpu_keys, cpu_values = self.retriever.retrieve(
+        # 2. CPU端：每个KV head独立检索top-k token并计算per-head attention
+        o_cpu, lse_cpu = self.retriever.retrieve_and_compute(
             layer_idx=layer_idx,
             query=query,
             num_q_heads=num_q_heads,
             batch_idx=batch_idx,
+            device=self.device,
+            head_dim=self.head_dim,
         )
+        # o_cpu:   [1, num_q_heads, 1, head_dim]  or None
+        # lse_cpu: [1, num_q_heads, 1]             or None
 
-        # 3. 合并结果
-        if cpu_keys is None or cpu_keys.size(2) == 0:
-            # 没有检索到CPU KV，只使用GPU结果
+        if o_cpu is None:
+            # CPU cache 无数据，直接返回GPU结果
             return o_gpu
 
-        # 计算CPU部分的attention
-        from .hybrid_attention import compute_cpu_attention, merge_attention_lse
+        # 3. 用 LSE 方法合并 GPU 和 CPU 两部分的 attention 结果
+        from .hybrid_attention import merge_attention_lse
 
-        o_cpu, lse_cpu = compute_cpu_attention(
-            query=query,
-            keys=cpu_keys,
-            values=cpu_values,
-            head_dim=self.head_dim,
-            return_lse=True,
-        )
-
-        # 合并GPU和CPU的结果
-        o_merged, lse_merged = merge_attention_lse(o_gpu, lse_gpu, o_cpu, lse_cpu)
+        o_merged, _ = merge_attention_lse(o_gpu, lse_gpu, o_cpu, lse_cpu)
 
         return o_merged
 
@@ -287,6 +287,10 @@ class HybridKVCacheManager:
         self.indexer.clear(batch_idx=batch_idx)
         self.is_offloaded = False
         logger.info("Cache cleared")
+
+    def get_seq_len(self, layer_idx: int = 0, batch_idx: int = 0) -> int:
+        """返回指定层当前的序列长度（委托给 gpu_cache）"""
+        return self.gpu_cache.get_seq_len(batch_idx=batch_idx, layer_idx=layer_idx)
 
     def get_statistics(self, batch_idx: int = 0) -> dict:
         """获取统计信息"""

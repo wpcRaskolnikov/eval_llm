@@ -1,14 +1,14 @@
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, cast
 
 import torch
 import torch.nn.functional as F
-from flashinfer import single_decode_with_kv_cache, single_prefill_with_kv_cache
+from flashinfer import single_prefill_with_kv_cache
 from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen3Config
 
-from kv_offload import GPUKVCache
+from kv_offload import HybridKVCacheManager
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -24,6 +24,12 @@ class Qwen3InferenceConfig:
 
     max_batch_size: int = 1
     max_seq_len: int = 1024
+
+    # KV offload 配置
+    offload_ratio: float = 0.5  # prefill 后 offload 的 token 比例
+    top_k_per_head: int = 32  # decode 时每个 head 检索的 top-k token 数
+    num_norm_buckets: int = 10  # 范数分桶数
+    offload_strategy: str = "middle"  # offload 策略: "middle" / "random" / "first"
 
     temperature: float = 0.7
     top_p: float = 0.9
@@ -57,7 +63,8 @@ class Qwen3Inference:
         self.hidden_size = model_config.hidden_size
         self.vocab_size = model_config.vocab_size
 
-        self.kv_cache = GPUKVCache(
+        # 使用 HybridKVCacheManager 同时管理 GPU cache 和 CPU offload
+        self.kv_cache = HybridKVCacheManager(
             num_layers=self.num_layers,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
@@ -65,6 +72,9 @@ class Qwen3Inference:
             max_seq_len=config.max_seq_len,
             dtype=config.dtype,
             device=self.device,
+            offload_ratio=config.offload_ratio,
+            top_k_per_head=config.top_k_per_head,
+            num_norm_buckets=config.num_norm_buckets,
         )
 
         logger.info(
@@ -72,16 +82,21 @@ class Qwen3Inference:
             f"{self.num_attention_heads} attention heads, "
             f"{self.num_kv_heads} KV heads, "
             f"head_dim={self.head_dim}, "
-            f"hidden_size={self.hidden_size}"
+            f"hidden_size={self.hidden_size}\n"
+            f"KV offload: ratio={config.offload_ratio}, "
+            f"top_k_per_head={config.top_k_per_head}"
         )
+
+    # ------------------------------------------------------------------
+    # RoPE
+    # ------------------------------------------------------------------
 
     def apply_rotary_emb(self, q, k, cos, sin, unsqueeze_dim=1):
         """
         Args:
             q: [batch_size, num_heads, seq_len, head_dim]
             k: [batch_size, num_kv_heads, seq_len, head_dim]
-            cos: [batch_size, seq_len, head_dim]
-            sin: [batch_size, seq_len, head_dim]
+            cos/sin: [batch_size, seq_len, head_dim]
         """
 
         def rotate_half(x):
@@ -89,12 +104,15 @@ class Qwen3Inference:
             x2 = x[..., x.shape[-1] // 2 :]
             return torch.cat((-x2, x1), dim=-1)
 
-        # cos, sin shape: [1, seq_len, head_dim]
         cos = cos.unsqueeze(unsqueeze_dim)
         sin = sin.unsqueeze(unsqueeze_dim)
         q_embed = (q * cos) + (rotate_half(q) * sin)
         k_embed = (k * cos) + (rotate_half(k) * sin)
         return q_embed, k_embed
+
+    # ------------------------------------------------------------------
+    # 单层前向
+    # ------------------------------------------------------------------
 
     def _forward_layer(
         self,
@@ -116,7 +134,7 @@ class Qwen3Inference:
         # Pre-attention LayerNorm
         hidden_states = layer.input_layernorm(hidden_states)
 
-        # Self-Attention
+        # ---- Self-Attention ----
         attn = layer.self_attn
 
         hidden_shape = (batch_size, seq_len, -1, self.head_dim)
@@ -132,7 +150,7 @@ class Qwen3Inference:
         value_states = attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         # value_states: [batch, num_kv_heads, seq_len, head_dim]
 
-        # Before Checked
+        # RoPE：position 从当前 cache 长度开始
         kv_seq_len = self.kv_cache.get_seq_len(layer_idx=layer_idx) + seq_len
         position_ids = torch.arange(
             kv_seq_len - seq_len,
@@ -145,17 +163,41 @@ class Qwen3Inference:
             query_states, key_states, cos, sin
         )
 
-        # 更新KV cache
-        self.kv_cache.update(layer_idx, key_states, value_states)
+        # ---- Prefill：将 KV 写入 GPU cache，用 FlashInfer 做 prefill attention ----
+        if is_prefill:
+            full_key, full_value = self.kv_cache.prefill(
+                layer_idx, key_states, value_states
+            )
+            # full_key/full_value: [1, num_kv_heads, total_seq_len, head_dim]
 
-        # 计算attention
-        attn_output, _ = self.kv_cache.compute_attention(
-            layer_idx,
-            query_states,
-            is_prefill=is_prefill,
-        )
+            # FlashInfer prefill 格式：HND layout
+            q = query_states.squeeze(0).transpose(
+                0, 1
+            )  # [seq_len, num_heads, head_dim]
+            k = full_key.squeeze(0)  # [num_kv_heads, seq_len, head_dim]
+            v = full_value.squeeze(0)  # [num_kv_heads, seq_len, head_dim]
 
-        # Reshape back: [batch,  seq_len, num_heads, head_dim] -> [batch, seq_len, hidden]
+            attn_output = single_prefill_with_kv_cache(
+                q=q, k=k, v=v, kv_layout="HND", causal=True
+            )
+            # attn_output: [seq_len, num_heads, head_dim]
+            attn_output = attn_output.unsqueeze(0)
+            # attn_output: [1, seq_len, num_heads, head_dim]
+
+        # ---- Decode：更新 GPU cache，做 hybrid attention（GPU local + CPU retrieved）----
+        else:
+            self.kv_cache.update_decode(layer_idx, key_states, value_states)
+
+            attn_output = self.kv_cache.decode(
+                layer_idx=layer_idx,
+                query=query_states,
+                num_q_heads=self.num_attention_heads,
+            )
+            # attn_output: [1, num_heads, 1, head_dim]
+
+        # ---- Reshape 回 [batch, seq_len, hidden_size] ----
+        # Prefill:  [1, seq_len, num_heads, head_dim] -> view OK（C-contiguous）
+        # Decode:   [1, num_heads, 1, head_dim]       -> view OK（相同元素总数且连续）
         attn_output = attn_output.view(
             batch_size, seq_len, self.num_attention_heads * self.head_dim
         )
@@ -163,7 +205,7 @@ class Qwen3Inference:
         # Output projection
         attn_output = attn.o_proj(attn_output)
 
-        # Residual connection
+        # Residual
         hidden_states = residual + attn_output
 
         # MLP
@@ -174,12 +216,15 @@ class Qwen3Inference:
 
         return hidden_states
 
+    # ------------------------------------------------------------------
+    # Prefill
+    # ------------------------------------------------------------------
+
     def prefill(self, input_ids: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len = input_ids.shape
         logger.info(f"Prefill: processing {seq_len} tokens")
 
         with torch.no_grad():
-            # checked
             hidden_states = self.model.model.embed_tokens(input_ids)
 
             for layer_idx in range(self.num_layers):
@@ -192,30 +237,33 @@ class Qwen3Inference:
 
         return logits
 
+    # ------------------------------------------------------------------
+    # Decode step
+    # ------------------------------------------------------------------
+
     def decode_step(self, token_id: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            token_id: [batch_size, 1] - 当前token
+            token_id: [batch_size, 1]
         Returns:
             logits: [batch_size, 1, vocab_size]
         """
         with torch.no_grad():
-            # Embedding
             hidden_states = self.model.model.embed_tokens(token_id)
 
-            # 逐层前向传播
             for layer_idx in range(self.num_layers):
                 hidden_states = self._forward_layer(
                     hidden_states, layer_idx, is_prefill=False
                 )
 
-            # Final LayerNorm
             hidden_states = self.model.model.norm(hidden_states)
-
-            # LM head
             logits = self.model.lm_head(hidden_states)
 
         return logits
+
+    # ------------------------------------------------------------------
+    # Sampling
+    # ------------------------------------------------------------------
 
     def _sample_token(
         self,
@@ -227,12 +275,6 @@ class Qwen3Inference:
         """
         Args:
             logits: [batch_size, vocab_size]
-            temperature: 温度参数
-                - T > 1: 分布更平滑，结果更随机
-                - T < 1: 分布更尖锐，结果更确定
-                - T = 0: 贪婪解码 (Greedy Decoding)
-            top_p: 仅保留累积概率达到 p 的 token 集合
-            top_k: 仅保留概率最高的 k 个 token
         Returns:
             token: [batch_size]
         """
@@ -250,22 +292,22 @@ class Qwen3Inference:
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
 
-            # Remove tokens with cumulative probability above the threshold
             sorted_indices_to_remove = cumulative_probs > top_p
-            # Keep at least one token
             sorted_indices_to_remove[..., 0] = False
 
-            # Scatter back to original indexing
             indices_to_remove = sorted_indices_to_remove.scatter(
                 1, sorted_indices, sorted_indices_to_remove
             )
             logits[indices_to_remove] = float("-inf")
 
-        # Sample
         probs = F.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
 
         return next_token.squeeze(-1)
+
+    # ------------------------------------------------------------------
+    # Generate
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def generate(
@@ -298,13 +340,21 @@ class Qwen3Inference:
         logger.info(f"Input: {prompt}")
         logger.info(f"Input tokens: {input_ids.shape[1]}")
 
-        # Prefill
+        # ---- Prefill ----
         prefill_start = time.time()
         logits = self.prefill(input_ids)
         prefill_time = time.time() - prefill_start
         logger.info(f"Prefill completed in {prefill_time:.3f}s")
 
-        # 获取第一个生成的token
+        # ---- KV Offload：prefill 后将中间部分 KV 卸载到 CPU 并建立分层索引 ----
+        if self.config.offload_ratio > 0:
+            offload_start = time.time()
+            self.kv_cache.trigger_offload(strategy=self.config.offload_strategy)
+            offload_time = time.time() - offload_start
+            logger.info(f"KV offload completed in {offload_time:.3f}s")
+            self.kv_cache.print_statistics()
+
+        # 第一个生成的 token
         next_token_logits = logits[:, -1, :]
         next_token = self._sample_token(next_token_logits, temperature, top_p, top_k)
         generated_tokens = [next_token.item()]
@@ -316,14 +366,12 @@ class Qwen3Inference:
                 flush=True,
             )
 
-        # Decode loop
+        # ---- Decode loop ----
         decode_start = time.time()
         for i in range(max_new_tokens - 1):
-            # Decode one token
             token_input = next_token.unsqueeze(-1)
             logits = self.decode_step(token_input)
 
-            # Sample next token
             next_token_logits = logits[:, -1, :]
             next_token = self._sample_token(
                 next_token_logits, temperature, top_p, top_k
@@ -339,12 +387,10 @@ class Qwen3Inference:
                     flush=True,
                 )
 
-            # Check for EOS
             if next_token.item() == self.tokenizer.eos_token_id:
                 logger.info(f"EOS reached at step {i + 1}")
                 break
 
-            # Progress logging
             if (i + 1) % 10 == 0:
                 logger.debug(f"Generated {i + 1} tokens")
 
@@ -352,14 +398,13 @@ class Qwen3Inference:
         tokens_per_sec = len(generated_tokens) / decode_time if decode_time > 0 else 0
 
         if stream:
-            print()  # New line after streaming
+            print()
 
         logger.info(
             f"Decode: {len(generated_tokens)} tokens in {decode_time:.3f}s "
             f"({tokens_per_sec:.2f} tokens/s)"
         )
 
-        # Decode generated tokens
         generated_text = self.tokenizer.decode(
             generated_tokens, skip_special_tokens=True
         )
@@ -368,19 +413,19 @@ class Qwen3Inference:
 
 
 def main():
-    # 配置
     config = Qwen3InferenceConfig(
         model_path="/home/wpc/huggingface/Qwen3-8B",
         temperature=0.7,
         top_p=0.9,
         top_k=50,
+        offload_ratio=0.5,
+        top_k_per_head=32,
+        offload_strategy="middle",
     )
 
-    # 初始化推理引擎
-    logger.info("Initializing Qwen3 Inference Engine")
+    logger.info("Initializing Qwen3 Inference Engine (with KV Offload)")
     engine = Qwen3Inference(config)
 
-    # 测试prompt
     prompt = "hello"
     with open("prompt.txt", "r") as f:
         prompt = f.read()
@@ -389,7 +434,6 @@ def main():
     logger.info("Starting Generation")
     logger.info("=" * 70)
 
-    # 生成
     result = engine.generate(
         prompt=prompt,
         max_new_tokens=100,
