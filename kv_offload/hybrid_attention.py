@@ -1,70 +1,11 @@
-"""混合Attention计算：GPU局部 + CPU检索 + LSE合并"""
+"""混合Attention计算：LSE合并"""
 
 import logging
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
-import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
-
-
-def compute_cpu_attention(
-    query: torch.Tensor,
-    keys: torch.Tensor,
-    values: torch.Tensor,
-    head_dim: int,
-    return_lse: bool = True,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """
-    计算CPU检索的KV的attention（在GPU上执行，但数据来自CPU cache）
-    Args:
-        query: [batch_size, num_q_heads, 1, head_dim]
-        keys: [batch_size, num_q_heads, num_retrieved, head_dim]
-        values: [batch_size, num_q_heads, num_retrieved, head_dim]
-        head_dim: head维度
-        return_lse: 是否返回LSE
-    Returns:
-        output: [batch_size, num_q_heads, 1, head_dim]
-        lse: [batch_size, num_q_heads, 1] 如果return_lse=True
-    """
-    if keys.size(2) == 0:
-        # 没有检索到任何KV
-        batch_size, num_heads = query.size(0), query.size(1)
-        output = torch.zeros_like(query)
-        if return_lse:
-            lse = torch.full(
-                (batch_size, num_heads, 1),
-                float("-inf"),
-                dtype=torch.float32,
-                device=query.device,
-            )
-            return output, lse
-        return output, None
-
-    # 计算attention scores: Q @ K^T / sqrt(d)
-    scale = 1.0 / (head_dim**0.5)
-    attn_weights = torch.matmul(query, keys.transpose(-2, -1)) * scale
-    # [batch_size, num_q_heads, 1, num_retrieved]
-
-    # 计算LSE
-    lse = None
-    if return_lse:
-        # LSE = max + log(sum(exp(x - max)))
-        max_score = torch.max(attn_weights, dim=-1, keepdim=True)[
-            0
-        ]  # [bs, heads, 1, 1]
-        lse = max_score.squeeze(-1) + torch.log(
-            torch.sum(torch.exp(attn_weights - max_score), dim=-1, keepdim=True)
-        ).squeeze(-1)  # [bs, heads, 1]
-
-    # Softmax + 乘以value
-    attn_weights = F.softmax(attn_weights, dim=-1)
-    output = torch.matmul(attn_weights, values)  # [bs, num_q_heads, 1, head_dim]
-
-    if return_lse:
-        return output, lse
-    return output, None
 
 
 def merge_attention_lse(
@@ -133,68 +74,12 @@ def merge_attention_lse(
     return o_merged, lse_merged
 
 
-def hybrid_attention(
-    query: torch.Tensor,
-    gpu_keys: Optional[torch.Tensor],
-    gpu_values: Optional[torch.Tensor],
-    cpu_keys: Optional[torch.Tensor],
-    cpu_values: Optional[torch.Tensor],
-    head_dim: int,
-) -> torch.Tensor:
-    """
-    混合attention：同时使用GPU cache和CPU检索的KV
-    Args:
-        query: [batch_size, num_q_heads, 1, head_dim]
-        gpu_keys: [batch_size, num_q_heads, gpu_len, head_dim] 或 None
-        gpu_values: [batch_size, num_q_heads, gpu_len, head_dim] 或 None
-        cpu_keys: [batch_size, num_q_heads, cpu_len, head_dim] 或 None
-        cpu_values: [batch_size, num_q_heads, cpu_len, head_dim] 或 None
-        head_dim: head维度
-    Returns:
-        output: [batch_size, num_q_heads, 1, head_dim]
-    """
-    has_gpu = gpu_keys is not None and gpu_keys.size(2) > 0
-    has_cpu = cpu_keys is not None and cpu_keys.size(2) > 0
-
-    if not has_gpu and not has_cpu:
-        # 没有任何KV，返回0
-        return torch.zeros_like(query)
-
-    if has_gpu and not has_cpu:
-        # 只有GPU KV
-        scale = 1.0 / (head_dim**0.5)
-        attn_weights = torch.matmul(query, gpu_keys.transpose(-2, -1)) * scale
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        return torch.matmul(attn_weights, gpu_values)
-
-    if has_cpu and not has_gpu:
-        # 只有CPU KV
-        scale = 1.0 / (head_dim**0.5)
-        attn_weights = torch.matmul(query, cpu_keys.transpose(-2, -1)) * scale
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        return torch.matmul(attn_weights, cpu_values)
-
-    # 两者都有，需要合并
-    # 计算GPU部分
-    o_gpu, lse_gpu = compute_cpu_attention(
-        query, gpu_keys, gpu_values, head_dim, return_lse=True
-    )
-
-    # 计算CPU部分
-    o_cpu, lse_cpu = compute_cpu_attention(
-        query, cpu_keys, cpu_values, head_dim, return_lse=True
-    )
-
-    # 合并
-    o_merged, lse_merged = merge_attention_lse(o_gpu, lse_gpu, o_cpu, lse_cpu)
-
-    return o_merged
-
-
 def test_merge_correctness():
     """
     测试LSE合并的正确性：验证合并后的结果与直接计算全部KV的结果一致
     """
+    import torch.nn.functional as F
+
     torch.manual_seed(42)
     batch_size, num_heads, head_dim = 1, 4, 64
     gpu_len, cpu_len = 50, 100
@@ -205,21 +90,29 @@ def test_merge_correctness():
     cpu_keys = torch.randn(batch_size, num_heads, cpu_len, head_dim)
     cpu_values = torch.randn(batch_size, num_heads, cpu_len, head_dim)
 
-    # 方法1：使用hybrid_attention合并
-    output_hybrid = hybrid_attention(
-        query, gpu_keys, gpu_values, cpu_keys, cpu_values, head_dim
-    )
+    scale = 1.0 / (head_dim**0.5)
+
+    # 方法1：分别计算 GPU/CPU attention，再用 merge_attention_lse 合并
+    def sdp_with_lse(q, k, v):
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        max_s = scores.max(dim=-1, keepdim=True)[0]
+        lse = (max_s + torch.log(torch.exp(scores - max_s).sum(dim=-1, keepdim=True))).squeeze(-1)
+        out = torch.matmul(F.softmax(scores, dim=-1), v)
+        return out, lse
+
+    o_gpu, lse_gpu = sdp_with_lse(query, gpu_keys, gpu_values)
+    o_cpu, lse_cpu = sdp_with_lse(query, cpu_keys, cpu_values)
+    output_merged, _ = merge_attention_lse(o_gpu, lse_gpu, o_cpu, lse_cpu)
 
     # 方法2：直接计算所有KV
     all_keys = torch.cat([gpu_keys, cpu_keys], dim=2)
     all_values = torch.cat([gpu_values, cpu_values], dim=2)
-    scale = 1.0 / (head_dim**0.5)
     attn_weights = torch.matmul(query, all_keys.transpose(-2, -1)) * scale
     attn_weights = F.softmax(attn_weights, dim=-1)
     output_direct = torch.matmul(attn_weights, all_values)
 
     # 比较
-    diff = torch.abs(output_hybrid - output_direct).max().item()
+    diff = torch.abs(output_merged - output_direct).max().item()
     print(f"Max difference: {diff}")
     print(f"Test {'PASSED' if diff < 1e-5 else 'FAILED'}")
 

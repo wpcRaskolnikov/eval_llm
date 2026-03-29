@@ -10,7 +10,7 @@ Main Components:
 - CPUKVCache: CPU-side storage with pin_memory
 - HierarchicalIndex: Layered indexing by key norm + cosine similarity
 - KVRetriever: Per-head retrieval logic
-- hybrid_attention: LSE-based attention merging
+- merge_attention_lse: LSE-based attention merging
 
 Usage:
     from kv_offload import HybridKVCacheManager
@@ -43,11 +43,7 @@ Usage:
 
 from .cpu_cache import CPUKVCache
 from .gpu_cache import GPUKVCache
-from .hybrid_attention import (
-    compute_cpu_attention,
-    hybrid_attention,
-    merge_attention_lse,
-)
+from .hybrid_attention import merge_attention_lse
 from .indexer import HierarchicalIndex
 from .offload_manager import HybridKVCacheManager
 from .retriever import KVRetriever
@@ -63,7 +59,5 @@ __all__ = [
     "HierarchicalIndex",
     "KVRetriever",
     # Attention functions
-    "hybrid_attention",
-    "compute_cpu_attention",
     "merge_attention_lse",
 ]

@@ -145,6 +145,7 @@ class GPUKVCache:
         Args:
             token_indices: [num_offload] 要offload的token位置
         """
+        token_indices = token_indices.to(self.device)
         self.valid_mask[batch_idx, layer_idx, token_indices] = False
         logger.debug(
             f"Layer {layer_idx}: Marked {len(token_indices)} tokens as offloaded"

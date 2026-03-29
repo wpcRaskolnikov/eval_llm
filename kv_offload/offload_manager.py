@@ -5,7 +5,6 @@ import torch
 
 from .cpu_cache import CPUKVCache
 from .gpu_cache import GPUKVCache
-from .hybrid_attention import hybrid_attention
 from .indexer import HierarchicalIndex
 from .retriever import KVRetriever
 
@@ -33,7 +32,9 @@ class HybridKVCacheManager:
         device: torch.device = torch.device("cuda"),
         offload_ratio: float = 0.5,
         top_k_per_head: int = 32,
-        num_norm_buckets: int = 10,
+        hnsw_M: int = 16,
+        hnsw_ef_construction: int = 200,
+        hnsw_ef_search: int = 50,
     ):
         """
         Args:
@@ -46,7 +47,9 @@ class HybridKVCacheManager:
             device: GPU设备
             offload_ratio: offload的token比例（0-1）
             top_k_per_head: CPU检索时每个head检索的token数量
-            num_norm_buckets: 范数分桶数量
+            hnsw_M: HNSW 每个节点的连接数（越大精度越高，内存越多）
+            hnsw_ef_construction: 建索引时的搜索深度（越大精度越高，建索引越慢）
+            hnsw_ef_search: 查询时的搜索深度（越大召回率越高，查询越慢）
         """
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -82,7 +85,10 @@ class HybridKVCacheManager:
         self.indexer = HierarchicalIndex(
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
-            num_norm_buckets=num_norm_buckets,
+            head_dim=head_dim,
+            M=hnsw_M,
+            ef_construction=hnsw_ef_construction,
+            ef_search=hnsw_ef_search,
             device="cpu",
         )
 
@@ -100,7 +106,7 @@ class HybridKVCacheManager:
             f"HybridKVCacheManager initialized:\n"
             f"  Layers: {num_layers}, KV Heads: {num_kv_heads}, Head Dim: {head_dim}\n"
             f"  Max Seq Len: {max_seq_len}, Offload Ratio: {offload_ratio}\n"
-            f"  Top-k per head: {top_k_per_head}, Norm Buckets: {num_norm_buckets}"
+            f"  Top-k per head: {top_k_per_head}, HNSW M={hnsw_M}, ef_search={hnsw_ef_search}"
         )
 
     def prefill(

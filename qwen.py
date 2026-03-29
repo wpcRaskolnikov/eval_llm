@@ -1,7 +1,7 @@
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Optional, cast
+from typing import Literal, Optional, cast
 
 import torch
 import torch.nn.functional as F
@@ -28,8 +28,10 @@ class Qwen3InferenceConfig:
     # KV offload 配置
     offload_ratio: float = 0.5  # prefill 后 offload 的 token 比例
     top_k_per_head: int = 32  # decode 时每个 head 检索的 top-k token 数
-    num_norm_buckets: int = 10  # 范数分桶数
-    offload_strategy: str = "middle"  # offload 策略: "middle" / "random" / "first"
+    hnsw_M: int = 16             # HNSW 每节点连接数
+    hnsw_ef_construction: int = 200  # 建索引搜索深度
+    hnsw_ef_search: int = 50    # 查询搜索深度
+    offload_strategy: Literal["middle", "random", "first"] = "middle"
 
     temperature: float = 0.7
     top_p: float = 0.9
@@ -74,7 +76,9 @@ class Qwen3Inference:
             device=self.device,
             offload_ratio=config.offload_ratio,
             top_k_per_head=config.top_k_per_head,
-            num_norm_buckets=config.num_norm_buckets,
+            hnsw_M=config.hnsw_M,
+            hnsw_ef_construction=config.hnsw_ef_construction,
+            hnsw_ef_search=config.hnsw_ef_search,
         )
 
         logger.info(
