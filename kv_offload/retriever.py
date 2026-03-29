@@ -4,7 +4,6 @@ import logging
 from typing import Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from .cpu_cache import CPUKVCache
 from .indexer import HierarchicalIndex
@@ -59,8 +58,8 @@ class KVRetriever:
         if not self.cpu_cache.has_data(layer_idx, batch_idx):
             return None, None
 
-        batch_size = query.size(0)
-        head_dim = query.size(3)
+        _batch_size = query.size(0)
+        _head_dim = query.size(3)
         num_kv_heads = self.cpu_cache.num_kv_heads
 
         # 收集所有heads检索到的token indices（去重）

@@ -1,6 +1,6 @@
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal, Optional, cast
 
 import torch
@@ -28,9 +28,9 @@ class Qwen3InferenceConfig:
     # KV offload 配置
     offload_ratio: float = 0.5  # prefill 后 offload 的 token 比例
     top_k_per_head: int = 32  # decode 时每个 head 检索的 top-k token 数
-    hnsw_M: int = 16             # HNSW 每节点连接数
+    hnsw_M: int = 16  # HNSW 每节点连接数
     hnsw_ef_construction: int = 200  # 建索引搜索深度
-    hnsw_ef_search: int = 50    # 查询搜索深度
+    hnsw_ef_search: int = 50  # 查询搜索深度
     offload_strategy: Literal["middle", "random", "first"] = "middle"
 
     temperature: float = 0.7
