@@ -55,7 +55,7 @@ class KVRetriever:
             retrieved_values: [batch_size, num_q_heads, num_retrieved, head_dim] 或 None
         """
         # 检查是否有CPU数据
-        if not self.cpu_cache.has_data(layer_idx, batch_idx):
+        if not self.cpu_cache.has_data(batch_idx):
             return None, None
 
         _batch_size = query.size(0)
@@ -181,11 +181,7 @@ class KVRetriever:
         head_dim: int = 64,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        每个KV head独立检索自己的top-k token，并计算对应q_head组的attention。
-
-        每个kv_head用组内第一个q_head的向量搜索索引，找到top-k个最相似的token，
-        然后对该组所有q_head分别计算 scaled dot-product attention，
-        最终拼接成完整的 cpu attention 输出。
+        所有 KV head 检索到的 token 取并集，每个 head 在并集上计算 attention。
 
         Args:
             query: [1, num_q_heads, 1, head_dim]  在GPU上
@@ -194,11 +190,11 @@ class KVRetriever:
             head_dim: head维度
 
         Returns:
-            o_cpu:   [1, num_q_heads, 1, head_dim]  在GPU上
+            o_cpu:   [1, 1, num_q_heads, head_dim]  在GPU上
             lse_cpu: [1, num_q_heads, 1]             float32，在GPU上
             两者均为 None 若 CPU cache 无数据
         """
-        if not self.cpu_cache.has_data(layer_idx, batch_idx):
+        if not self.cpu_cache.has_data(batch_idx):
             return None, None
 
         num_kv_heads = self.cpu_cache.num_kv_heads
@@ -217,108 +213,71 @@ class KVRetriever:
         num_stored = stored_indices.size(0)
         scale = 1.0 / (head_dim**0.5)
 
-        # 建立 token_position -> storage_position 映射，避免重复扫描
-        # stored_indices 在CPU上，转成 python dict 供快速查询
         pos_map: dict = {int(stored_indices[i].item()): i for i in range(num_stored)}
 
-        outputs = []  # 每个 q_head 对应一个 [head_dim] tensor
-        lses: list = []  # 每个 q_head 对应一个标量 tensor (float32)
-
+        # ---- 第一遍：所有 kv_head 检索结果取并集 ----
+        all_token_positions: set = set()
         for kv_head_idx in range(num_kv_heads):
-            q_head_start = kv_head_idx * n_rep
-
-            # 用该 kv_head 组内第一个 q_head 的向量做索引检索
-            q_search = query[0, q_head_start, 0, :].cpu()  # [head_dim]
-
-            # ---- 检索阶段（在CPU上完成） ----
             if not self.indexer.has_index(layer_idx, kv_head_idx, batch_idx):
-                # 该head无索引：填零输出 + -inf LSE
-                zero_out = torch.zeros(head_dim, dtype=query.dtype, device=device)
-                inf_lse = torch.full(
-                    (), float("-inf"), dtype=torch.float32, device=device
-                )
-                for _ in range(n_rep):
-                    outputs.append(zero_out)
-                    lses.append(inf_lse)
                 continue
-
-            top_k_token_positions = self.indexer.search(
+            q_head_start = kv_head_idx * n_rep
+            q_search = query[0, q_head_start, 0, :].cpu()
+            top_k_positions = self.indexer.search(
                 layer_idx=layer_idx,
                 head_idx=kv_head_idx,
                 query=q_search,
                 top_k=self.top_k_per_head,
                 batch_idx=batch_idx,
-            )  # [top_k] —— 原始token位置，在CPU上
-
-            if len(top_k_token_positions) == 0:
-                zero_out = torch.zeros(head_dim, dtype=query.dtype, device=device)
-                inf_lse = torch.full(
-                    (), float("-inf"), dtype=torch.float32, device=device
-                )
-                for _ in range(n_rep):
-                    outputs.append(zero_out)
-                    lses.append(inf_lse)
-                continue
-
-            # 将 token 位置映射到存储下标
-            storage_pos = [
-                pos_map[int(t.item())]
-                for t in top_k_token_positions
-                if int(t.item()) in pos_map
-            ]
-            if len(storage_pos) == 0:
-                zero_out = torch.zeros(head_dim, dtype=query.dtype, device=device)
-                inf_lse = torch.full(
-                    (), float("-inf"), dtype=torch.float32, device=device
-                )
-                for _ in range(n_rep):
-                    outputs.append(zero_out)
-                    lses.append(inf_lse)
-                continue
-
-            storage_pos_t = torch.tensor(storage_pos, dtype=torch.long)
-
-            # 取出该 kv_head 检索到的 K/V，传到GPU
-            # k_head: [num_found, head_dim]
-            k_head = keys_all[kv_head_idx, storage_pos_t, :].to(
-                dtype=query.dtype, device=device
             )
-            v_head = values_all[kv_head_idx, storage_pos_t, :].to(
-                dtype=query.dtype, device=device
-            )
+            all_token_positions.update(top_k_positions.tolist())
 
-            # ---- 计算阶段（在GPU上完成） ----
-            # 对该组内每个 q_head 单独计算 attention
-            for rep_idx in range(n_rep):
-                q_head_idx = q_head_start + rep_idx
-                q_vec = query[0, q_head_idx, 0, :]  # [head_dim]
+        if len(all_token_positions) == 0:
+            return None, None
 
-                # scores: [num_found]
-                scores = torch.mv(k_head, q_vec) * scale  # k_head @ q_vec^T
+        # 映射到存储下标（升序，与 stored_indices 对齐）
+        storage_pos = sorted(pos_map[p] for p in all_token_positions if p in pos_map)
+        if len(storage_pos) == 0:
+            return None, None
 
-                # 数值稳定的 LSE
-                max_s = scores.max()
-                exp_shifted = torch.exp(scores - max_s)
-                sum_exp = exp_shifted.sum()
-                lse_h = (max_s + torch.log(sum_exp)).to(torch.float32)
+        storage_pos_t = torch.tensor(storage_pos, dtype=torch.long)
 
-                # softmax + weighted sum
-                attn_w = exp_shifted / sum_exp  # [num_found]
-                out = torch.mv(v_head.T, attn_w)  # [head_dim]  = v_head^T @ attn_w
+        # ---- 第二遍：batched attention，所有 head 并行计算 ----
+        # keys_union/values_union: [num_kv_heads, num_union, head_dim] -> GPU
+        keys_union = keys_all[:, storage_pos_t, :].to(dtype=query.dtype, device=device)
+        values_union = values_all[:, storage_pos_t, :].to(
+            dtype=query.dtype, device=device
+        )
 
-                outputs.append(out)
-                lses.append(lse_h)
+        # GQA 扩展: [num_kv_heads, ...] -> [num_q_heads, ...]
+        if n_rep > 1:
+            keys_union = keys_union.repeat_interleave(n_rep, dim=0)
+            values_union = values_union.repeat_interleave(n_rep, dim=0)
 
-        # 拼装输出
-        # o_cpu: [1, num_q_heads, 1, head_dim]
-        o_cpu = torch.stack(outputs, dim=0).unsqueeze(0).unsqueeze(2)
+        # q: [num_q_heads, 1, head_dim]
+        q = query[0, :, 0, :].unsqueeze(1)
 
+        # scores: [num_q_heads, 1, num_union] -> [num_q_heads, num_union]
+        scores = torch.bmm(q, keys_union.transpose(1, 2)).squeeze(1) * scale
+
+        max_s = scores.max(dim=-1, keepdim=True).values  # [num_q_heads, 1]
+        exp_shifted = torch.exp(scores - max_s)  # [num_q_heads, num_union]
+        sum_exp = exp_shifted.sum(dim=-1, keepdim=True)  # [num_q_heads, 1]
+        lse = (
+            (max_s + torch.log(sum_exp)).squeeze(-1).to(torch.float32)
+        )  # [num_q_heads]
+
+        attn_w = exp_shifted / sum_exp  # [num_q_heads, num_union]
+        # out: [num_q_heads, 1, num_union] x [num_q_heads, num_union, head_dim] -> [num_q_heads, head_dim]
+        out = torch.bmm(attn_w.unsqueeze(1), values_union).squeeze(1)
+
+        # o_cpu: [1, 1, num_q_heads, head_dim]
+        o_cpu = out.unsqueeze(0).unsqueeze(1)
         # lse_cpu: [1, num_q_heads, 1]
-        lse_cpu = torch.stack(lses, dim=0).unsqueeze(0).unsqueeze(-1)
+        lse_cpu = lse.unsqueeze(0).unsqueeze(-1)
 
         logger.debug(
-            f"Layer {layer_idx}: per-head CPU attention computed, "
-            f"o_cpu shape={o_cpu.shape}"
+            f"Layer {layer_idx}: union CPU attention, "
+            f"{len(storage_pos)} tokens, o_cpu shape={o_cpu.shape}"
         )
 
         return o_cpu, lse_cpu

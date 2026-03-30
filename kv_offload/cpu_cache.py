@@ -12,7 +12,7 @@ class CPUKVCache:
         num_layers: int,
         num_kv_heads: int,
         head_dim: int,
-        dtype: torch.dtype = torch.float16,
+        dtype: torch.dtype = torch.float32,
         pin_memory: bool = True,
     ):
         self.num_layers = num_layers
@@ -21,10 +21,10 @@ class CPUKVCache:
         self.dtype = dtype
         self.pin_memory = pin_memory
 
-        # 存储结构: {(layer_idx, batch_idx): {"keys": tensor, "values": tensor, "token_indices": tensor}}
+        # 存储结构: {batch_idx: {layer_idx: {"keys": tensor, "values": tensor, "token_indices": tensor}}}
         # keys/values: [num_kv_heads, num_offloaded_tokens, head_dim]
         # token_indices: [num_offloaded_tokens] 原始位置索引
-        self.storage: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
+        self.storage: Dict[int, Dict[int, Dict[str, torch.Tensor]]] = {}
 
         logger.info(
             f"CPUKVCache initialized: {num_layers} layers, "
@@ -62,8 +62,7 @@ class CPUKVCache:
             keys_cpu = keys_cpu.to(self.dtype)
             values_cpu = values_cpu.to(self.dtype)
 
-        key = (layer_idx, batch_idx)
-        self.storage[key] = {
+        self.storage.setdefault(batch_idx, {})[layer_idx] = {
             "keys": keys_cpu,
             "values": values_cpu,
             "token_indices": token_indices_cpu,
@@ -84,14 +83,13 @@ class CPUKVCache:
             values: [num_kv_heads, num_tokens, head_dim] 在CPU上
             token_indices: [num_tokens] token位置
         """
-        key = (layer_idx, batch_idx)
-        if key not in self.storage:
+        if batch_idx not in self.storage or layer_idx not in self.storage[batch_idx]:
             # 返回空tensor
             empty = torch.empty(self.num_kv_heads, 0, self.head_dim, dtype=self.dtype)
             empty_indices = torch.empty(0, dtype=torch.long)
             return empty, empty, empty_indices
 
-        data = self.storage[key]
+        data = self.storage[batch_idx][layer_idx]
         return data["keys"], data["values"], data["token_indices"]
 
     def get_subset(
@@ -108,83 +106,50 @@ class CPUKVCache:
             keys: [num_kv_heads, num_retrieve, head_dim]
             values: [num_kv_heads, num_retrieve, head_dim]
         """
-        key = (layer_idx, batch_idx)
-        if key not in self.storage or len(retrieve_indices) == 0:
+        if (
+            batch_idx not in self.storage
+            or layer_idx not in self.storage[batch_idx]
+            or len(retrieve_indices) == 0
+        ):
             empty = torch.empty(self.num_kv_heads, 0, self.head_dim, dtype=self.dtype)
             return empty, empty
 
-        data = self.storage[key]
-        stored_indices = data["token_indices"]  # [num_stored]
+        data = self.storage[batch_idx][layer_idx]
+        stored_indices = data["token_indices"]
 
-        # 找到retrieve_indices在stored_indices中的位置
-        # 使用broadcasting找交集
-        # retrieve_indices: [num_retrieve]
-        # stored_indices: [num_stored]
-        mask = retrieve_indices.unsqueeze(1) == stored_indices.unsqueeze(
-            0
-        )  # [num_retrieve, num_stored]
-        positions = torch.nonzero(mask, as_tuple=False)[:, 1]  # [num_found]
+        # stored_indices 已经是升序排列的
+        positions = torch.searchsorted(stored_indices, retrieve_indices)
 
         if len(positions) == 0:
             empty = torch.empty(self.num_kv_heads, 0, self.head_dim, dtype=self.dtype)
             return empty, empty
 
-        # 提取对应的KV
-        keys = data["keys"][:, positions, :]  # [heads, num_found, dim]
+        keys = data["keys"][:, positions, :]
         values = data["values"][:, positions, :]
 
         return keys, values
 
-    def get_keys_for_indexing(
-        self, layer_idx: int, batch_idx: int = 0
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        获取keys用于建立索引
-        Returns:
-            keys: [num_kv_heads, num_tokens, head_dim]
-            token_indices: [num_tokens]
-        """
-        keys, _, token_indices = self.get(layer_idx, batch_idx)
-        return keys, token_indices
+    def has_data(self, batch_idx: int = 0) -> bool:
+        return batch_idx in self.storage
 
-    def has_data(self, layer_idx: int, batch_idx: int = 0) -> bool:
-        """检查是否有offloaded数据"""
-        key = (layer_idx, batch_idx)
-        return key in self.storage and self.storage[key]["keys"].size(1) > 0
-
-    def get_num_tokens(self, layer_idx: int, batch_idx: int = 0) -> int:
-        """获取offloaded token数量"""
-        key = (layer_idx, batch_idx)
-        if key not in self.storage:
+    def get_num_tokens(self, batch_idx: int = 0) -> int:
+        if batch_idx not in self.storage:
             return 0
-        return self.storage[key]["keys"].size(1)
+        return next(iter(self.storage[batch_idx].values()))["keys"].size(1)
 
-    def clear(self, layer_idx: Optional[int] = None, batch_idx: Optional[int] = None):
-        if layer_idx is not None and batch_idx is not None:
-            key = (layer_idx, batch_idx)
-            if key in self.storage:
-                del self.storage[key]
-        elif layer_idx is not None:
-            # 清空该层所有batch
-            keys_to_delete = [k for k in self.storage.keys() if k[0] == layer_idx]
-            for k in keys_to_delete:
-                del self.storage[k]
-        elif batch_idx is not None:
-            # 清空该batch所有层
-            keys_to_delete = [k for k in self.storage.keys() if k[1] == batch_idx]
-            for k in keys_to_delete:
-                del self.storage[k]
+    def clear(self, batch_idx: Optional[int] = None):
+        if batch_idx is not None:
+            self.storage.pop(batch_idx, None)
         else:
-            # 清空所有
             self.storage.clear()
 
     def get_memory_usage_mb(self) -> float:
-        """获取CPU cache内存使用量（MB）"""
         total_bytes = 0
-        for data in self.storage.values():
-            total_bytes += data["keys"].element_size() * data["keys"].numel()
-            total_bytes += data["values"].element_size() * data["values"].numel()
-            total_bytes += (
-                data["token_indices"].element_size() * data["token_indices"].numel()
-            )
+        for layers in self.storage.values():
+            for data in layers.values():
+                total_bytes += data["keys"].element_size() * data["keys"].numel()
+                total_bytes += data["values"].element_size() * data["values"].numel()
+                total_bytes += (
+                    data["token_indices"].element_size() * data["token_indices"].numel()
+                )
         return total_bytes / (1024 * 1024)

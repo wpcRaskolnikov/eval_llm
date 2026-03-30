@@ -1,6 +1,7 @@
 import logging
 from typing import Literal, Optional
 
+import flashinfer
 import torch
 
 from .cpu_cache import CPUKVCache
@@ -32,6 +33,7 @@ class HybridKVCacheManager:
         device: torch.device = torch.device("cuda"),
         offload_ratio: float = 0.5,
         top_k_per_head: int = 32,
+        num_norm_buckets: int = 10,
         hnsw_M: int = 16,
         hnsw_ef_construction: int = 200,
         hnsw_ef_search: int = 50,
@@ -47,9 +49,10 @@ class HybridKVCacheManager:
             device: GPU设备
             offload_ratio: offload的token比例（0-1）
             top_k_per_head: CPU检索时每个head检索的token数量
-            hnsw_M: HNSW 每个节点的连接数（越大精度越高，内存越多）
-            hnsw_ef_construction: 建索引时的搜索深度（越大精度越高，建索引越慢）
-            hnsw_ef_search: 查询时的搜索深度（越大召回率越高，查询越慢）
+            num_norm_buckets: 范数分桶数量
+            hnsw_M: HNSW M参数
+            hnsw_ef_construction: HNSW ef_construction参数
+            hnsw_ef_search: HNSW ef_search参数
         """
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -85,7 +88,7 @@ class HybridKVCacheManager:
         self.indexer = HierarchicalIndex(
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
+            num_norm_buckets=num_norm_buckets,
             M=hnsw_M,
             ef_construction=hnsw_ef_construction,
             ef_search=hnsw_ef_search,
@@ -106,7 +109,7 @@ class HybridKVCacheManager:
             f"HybridKVCacheManager initialized:\n"
             f"  Layers: {num_layers}, KV Heads: {num_kv_heads}, Head Dim: {head_dim}\n"
             f"  Max Seq Len: {max_seq_len}, Offload Ratio: {offload_ratio}\n"
-            f"  Top-k per head: {top_k_per_head}, HNSW M={hnsw_M}, ef_search={hnsw_ef_search}"
+            f"  Top-k per head: {top_k_per_head}, HNSW M={hnsw_M}, ef_search={hnsw_ef_search}, num_norm_buckets={num_norm_buckets}"
         )
 
     def prefill(
@@ -142,7 +145,7 @@ class HybridKVCacheManager:
         logger.info(f"Triggering offload with strategy: {strategy}")
 
         for layer_idx in range(self.num_layers):
-            seq_len = self.gpu_cache.get_seq_len(batch_idx, layer_idx)
+            seq_len = self.gpu_cache.get_seq_len(layer_idx, batch_idx)
 
             if seq_len == 0:
                 continue
@@ -245,7 +248,7 @@ class HybridKVCacheManager:
             batch_idx=batch_idx,
             return_lse=True,
         )
-        # o_gpu:   [1, num_q_heads, 1, head_dim]
+        # o_gpu:   [1, 1, num_q_heads, head_dim]
         # lse_gpu: [1, num_q_heads, 1]
 
         # 2. CPU端：每个KV head独立检索top-k token并计算per-head attention
@@ -257,7 +260,7 @@ class HybridKVCacheManager:
             device=self.device,
             head_dim=self.head_dim,
         )
-        # o_cpu:   [1, num_q_heads, 1, head_dim]  or None
+        # o_cpu:   [1, 1, num_q_heads, head_dim]  or None
         # lse_cpu: [1, num_q_heads, 1]             or None
 
         if o_cpu is None:
@@ -265,11 +268,14 @@ class HybridKVCacheManager:
             return o_gpu
 
         # 3. 用 LSE 方法合并 GPU 和 CPU 两部分的 attention 结果
-        from .hybrid_attention import merge_attention_lse
-
-        o_merged, _ = merge_attention_lse(o_gpu, lse_gpu, o_cpu, lse_cpu)
-
-        return o_merged
+        # flashinfer.merge_state 需要 [seq_len, num_heads, head_dim] / [seq_len, num_heads]
+        o_merged, _ = flashinfer.merge_state(
+            o_gpu.squeeze(1),
+            lse_gpu.squeeze(2).float(),
+            o_cpu.squeeze(1),
+            lse_cpu.squeeze(2).float(),
+        )
+        return o_merged.unsqueeze(1)
 
     def update_decode(
         self,
@@ -294,7 +300,7 @@ class HybridKVCacheManager:
         self.is_offloaded = False
         logger.info("Cache cleared")
 
-    def get_seq_len(self, layer_idx: int = 0, batch_idx: int = 0) -> int:
+    def get_seq_len(self, layer_idx: int, batch_idx: int = 0) -> int:
         """返回指定层当前的序列长度（委托给 gpu_cache）"""
         return self.gpu_cache.get_seq_len(batch_idx=batch_idx, layer_idx=layer_idx)
 
@@ -306,9 +312,9 @@ class HybridKVCacheManager:
         }
 
         for layer_idx in range(self.num_layers):
-            seq_len = self.gpu_cache.get_seq_len(batch_idx, layer_idx)
+            seq_len = self.gpu_cache.get_seq_len(layer_idx, batch_idx)
             num_gpu = self.gpu_cache.get_num_valid_tokens(layer_idx, batch_idx)
-            num_cpu = self.cpu_cache.get_num_tokens(layer_idx, batch_idx)
+            num_cpu = self.cpu_cache.get_num_tokens(batch_idx)
 
             stats["layers"][layer_idx] = {
                 "total_tokens": seq_len,

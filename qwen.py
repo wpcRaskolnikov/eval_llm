@@ -5,7 +5,6 @@ from typing import Literal, Optional, cast
 
 import torch
 import torch.nn.functional as F
-from flashinfer import single_prefill_with_kv_cache
 from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen3Config
 
 from kv_offload import HybridKVCacheManager
@@ -28,9 +27,10 @@ class Qwen3InferenceConfig:
     # KV offload 配置
     offload_ratio: float = 0.5  # prefill 后 offload 的 token 比例
     top_k_per_head: int = 32  # decode 时每个 head 检索的 top-k token 数
-    hnsw_M: int = 16  # HNSW 每节点连接数
-    hnsw_ef_construction: int = 200  # 建索引搜索深度
-    hnsw_ef_search: int = 50  # 查询搜索深度
+    num_norm_buckets: int = 10  # 范数分桶数量
+    hnsw_M: int = 16
+    hnsw_ef_construction: int = 200
+    hnsw_ef_search: int = 50
     offload_strategy: Literal["middle", "random", "first"] = "middle"
 
     temperature: float = 0.7
@@ -76,6 +76,7 @@ class Qwen3Inference:
             device=self.device,
             offload_ratio=config.offload_ratio,
             top_k_per_head=config.top_k_per_head,
+            num_norm_buckets=config.num_norm_buckets,
             hnsw_M=config.hnsw_M,
             hnsw_ef_construction=config.hnsw_ef_construction,
             hnsw_ef_search=config.hnsw_ef_search,
@@ -169,23 +170,12 @@ class Qwen3Inference:
 
         # ---- Prefill：将 KV 写入 GPU cache，用 FlashInfer 做 prefill attention ----
         if is_prefill:
-            full_key, full_value = self.kv_cache.prefill(
-                layer_idx, key_states, value_states
+            self.kv_cache.prefill(layer_idx, key_states, value_states)
+            attn_output, _ = self.kv_cache.gpu_cache.compute_attention(
+                layer_idx=layer_idx,
+                query=query_states,
+                is_prefill=True,
             )
-            # full_key/full_value: [1, num_kv_heads, total_seq_len, head_dim]
-
-            # FlashInfer prefill 格式：HND layout
-            q = query_states.squeeze(0).transpose(
-                0, 1
-            )  # [seq_len, num_heads, head_dim]
-            k = full_key.squeeze(0)  # [num_kv_heads, seq_len, head_dim]
-            v = full_value.squeeze(0)  # [num_kv_heads, seq_len, head_dim]
-
-            attn_output = single_prefill_with_kv_cache(
-                q=q, k=k, v=v, kv_layout="HND", causal=True
-            )
-            # attn_output: [seq_len, num_heads, head_dim]
-            attn_output = attn_output.unsqueeze(0)
             # attn_output: [1, seq_len, num_heads, head_dim]
 
         # ---- Decode：更新 GPU cache，做 hybrid attention（GPU local + CPU retrieved）----
@@ -197,7 +187,7 @@ class Qwen3Inference:
                 query=query_states,
                 num_q_heads=self.num_attention_heads,
             )
-            # attn_output: [1, num_heads, 1, head_dim]
+            # attn_output: [1, 1, num_heads, head_dim]
 
         # ---- Reshape 回 [batch, seq_len, hidden_size] ----
         # Prefill:  [1, seq_len, num_heads, head_dim] -> view OK（C-contiguous）
@@ -422,8 +412,8 @@ def main():
         temperature=0.7,
         top_p=0.9,
         top_k=50,
-        offload_ratio=0.5,
-        top_k_per_head=32,
+        offload_ratio=0.7,
+        top_k_per_head=12,
         offload_strategy="middle",
     )
 
