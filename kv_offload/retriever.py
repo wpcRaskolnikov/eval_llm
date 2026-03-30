@@ -1,9 +1,13 @@
 """KV检索：从CPU cache中检索相似的KV用于attention计算"""
 
 import logging
+import math
 from typing import Optional, Tuple
 
 import torch
+
+# log2(e)：用于将自然对数 lse 转换为 log2-base lse，与 flashinfer 对齐
+_LOG2E = math.log2(math.e)
 
 from .cpu_cache import CPUKVCache
 from .indexer import HierarchicalIndex
@@ -179,6 +183,7 @@ class KVRetriever:
         batch_idx: int = 0,
         device: torch.device = None,
         head_dim: int = 64,
+        use_log2_lse: bool = True,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         所有 KV head 检索到的 token 取并集，每个 head 在并集上计算 attention。
@@ -188,6 +193,8 @@ class KVRetriever:
             num_q_heads: query head数量（GQA时 > num_kv_heads）
             device: 计算设备（GPU）
             head_dim: head维度
+            use_log2_lse: 若 True（默认），返回的 lse 使用 log2 base，与 flashinfer
+                          的 merge_state 保持一致；若 False，返回自然对数 base 的 lse。
 
         Returns:
             o_cpu:   [1, 1, num_q_heads, head_dim]  在GPU上
@@ -265,6 +272,8 @@ class KVRetriever:
         lse = (
             (max_s + torch.log(sum_exp)).squeeze(-1).to(torch.float32)
         )  # [num_q_heads]
+        if use_log2_lse:
+            lse = lse * _LOG2E  # 转换为 log2 base，与 flashinfer 对齐
 
         attn_w = exp_shifted / sum_exp  # [num_q_heads, num_union]
         # out: [num_q_heads, 1, num_union] x [num_q_heads, num_union, head_dim] -> [num_q_heads, head_dim]
