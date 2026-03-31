@@ -231,6 +231,7 @@ class HybridKVCacheManager:
             output, _ = self.gpu_cache.compute_attention(
                 layer_idx=layer_idx,
                 query=query,
+                is_prefill=False,
                 batch_idx=batch_idx,
                 return_lse=False,
             )
@@ -240,6 +241,7 @@ class HybridKVCacheManager:
         o_gpu, lse_gpu = self.gpu_cache.compute_attention(
             layer_idx=layer_idx,
             query=query,
+            is_prefill=False,
             batch_idx=batch_idx,
             return_lse=True,
         )

@@ -273,7 +273,7 @@ class Qwen3Inference:
             token: [batch_size]
         """
         if temperature == 0:
-            return torch.argmax(logits, dim=-1, keepdim=True)
+            return torch.argmax(logits, dim=-1)
 
         logits = logits / temperature
 
@@ -403,7 +403,7 @@ class Qwen3Inference:
             generated_tokens, skip_special_tokens=True
         )
 
-        return prompt + generated_text
+        return generated_text
 
 
 def main():

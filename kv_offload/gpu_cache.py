@@ -46,12 +46,9 @@ class GPUKVCache:
             device=device,
         )
 
-        # 记录每层当前的sequence length
         self.seq_lens = torch.zeros(
             max_batch_size, num_layers, dtype=torch.int32, device=device
         )
-
-        # 标记哪些token位置是有效的
         self.valid_mask = torch.ones(
             max_batch_size,
             num_layers,
@@ -72,35 +69,22 @@ class GPUKVCache:
         value_states: torch.Tensor,
         batch_idx: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        更新GPU cache
-        Args:
-            key_states: [batch_size, num_kv_heads, seq_len, head_dim]
-            value_states: [batch_size, num_kv_heads, seq_len, head_dim]
-        Returns:
-            完整的key和value: [batch_size, num_kv_heads, total_seq_len, head_dim]
-        """
-        batch_size, num_heads, seq_len, head_dim = key_states.shape
-        current_len = self.seq_lens[batch_idx][layer_idx].item()
+        seq_len = key_states.shape[2]
+        current_len = int(self.seq_lens[batch_idx, layer_idx])
 
-        # 写入新的KV到cache
         self.key_cache[
             batch_idx, layer_idx, :, current_len : current_len + seq_len, :
         ] = key_states[0]
         self.value_cache[
             batch_idx, layer_idx, :, current_len : current_len + seq_len, :
         ] = value_states[0]
-
-        # 标记这些位置为有效
         self.valid_mask[batch_idx, layer_idx, current_len : current_len + seq_len] = (
             True
         )
-
-        # 更新sequence length
         new_len = current_len + seq_len
         self.seq_lens[batch_idx][layer_idx] = new_len
 
-        # 返回完整的KV，保留batch维度
+        # return full KV with batch dim preserved
         full_key = self.key_cache[batch_idx : batch_idx + 1, layer_idx, :, :new_len, :]
         full_value = self.value_cache[
             batch_idx : batch_idx + 1, layer_idx, :, :new_len, :
@@ -111,37 +95,25 @@ class GPUKVCache:
     def get(
         self, layer_idx: int, batch_idx: int = 0
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        获取GPU上的KV
-        Returns:
-            key, value: [1, num_kv_heads, seq_len, head_dim]
-        """
-        seq_len = self.seq_lens[batch_idx][layer_idx].item()
-        key = self.key_cache[batch_idx : batch_idx + 1, layer_idx, :, :seq_len, :]
+        seq_len = int(self.seq_lens[batch_idx, layer_idx])
+        key = self.key_cache[
+            batch_idx : batch_idx + 1, layer_idx, :, :seq_len, :
+        ]  # [1, num_kv_heads, seq_len, head_dim]
         value = self.value_cache[batch_idx : batch_idx + 1, layer_idx, :, :seq_len, :]
         return key, value
 
     def get_valid_kv(
         self, layer_idx: int, batch_idx: int = 0
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        获取GPU上有效的KV（未被offload的）
-        Returns:
-            key: [1, num_kv_heads, valid_seq_len, head_dim]
-            value: [1, num_kv_heads, valid_seq_len, head_dim]
-            valid_indices: [valid_seq_len] token位置索引
-        """
-        seq_len = self.seq_lens[batch_idx][layer_idx].item()
+        seq_len = int(self.seq_lens[batch_idx, layer_idx])
         valid_mask = self.valid_mask[batch_idx, layer_idx, :seq_len]
         valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
 
-        # 提取有效的KV
         key = self.key_cache[
             batch_idx, layer_idx, :, valid_indices, :
         ]  # [heads, valid_len, dim]
         value = self.value_cache[batch_idx, layer_idx, :, valid_indices, :]
 
-        # 添加batch维度
         key = key.unsqueeze(0)  # [1, heads, valid_len, dim]
         value = value.unsqueeze(0)
 
@@ -150,11 +122,6 @@ class GPUKVCache:
     def mark_offloaded(
         self, layer_idx: int, token_indices: torch.Tensor, batch_idx: int = 0
     ):
-        """
-        标记某些tokens已被offload到CPU
-        Args:
-            token_indices: [num_offload] 要offload的token位置
-        """
         token_indices = token_indices.to(self.device)
         self.valid_mask[batch_idx, layer_idx, token_indices] = False
 
@@ -163,45 +130,32 @@ class GPUKVCache:
         self,
         layer_idx: int,
         query: torch.Tensor,
-        return_lse: Literal[True],
-        is_prefill: bool = ...,
+        is_prefill: bool,
+        return_lse: Literal[False] = ...,
         batch_idx: int = ...,
-    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
+    ) -> Tuple[torch.Tensor, None]: ...
 
     @overload
     def compute_attention(
         self,
         layer_idx: int,
         query: torch.Tensor,
-        return_lse: Literal[False] = ...,
-        is_prefill: bool = ...,
+        is_prefill: bool,
+        return_lse: Literal[True],
         batch_idx: int = ...,
-    ) -> Tuple[torch.Tensor, None]: ...
+    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def compute_attention(
         self,
         layer_idx: int,
         query: torch.Tensor,
+        is_prefill: bool,
         return_lse: bool = False,
-        is_prefill: bool = False,
         batch_idx: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Args:
-            layer_idx: 层索引
-            query: [batch_size, num_heads, seq_len_q, head_dim]
-            is_prefill: 是否为prefill阶段
-            batch_idx: batch索引
-            return_lse: 是否返回LSE用于后续合并
-        Returns:
-            output: prefill时 [batch, seq_len_q, num_heads, head_dim],
-                    decode时  [batch, 1, num_heads, head_dim]
-            lse: Optional[torch.Tensor]
-        """
         key, value, _ = self.get_valid_kv(layer_idx, batch_idx)
-        # key/value: [1, num_kv_heads, seq_len_k, head_dim]
 
-        # FlashInfer 格式转换
+        # convert to FlashInfer layout
         q = query.squeeze(0).transpose(0, 1)  # [seq_len_q, num_heads, head_dim]
         k = key.squeeze(0)  # [num_kv_heads, seq_len_k, head_dim]
         v = value.squeeze(0)  # [num_kv_heads, seq_len_k, head_dim]
@@ -216,12 +170,9 @@ class GPUKVCache:
                 output = single_prefill_with_kv_cache(
                     q=q, k=k, v=v, kv_layout="HND", causal=True
                 )
-            # output: [seq_len_q, num_heads, head_dim]
-            output = output.unsqueeze(0)
-            # output: [1, seq_len_q, num_heads, head_dim]
+            output = output.unsqueeze(0)  # [1, seq_len_q, num_heads, head_dim]
         else:
-            # Decode: q 需要是 [num_heads, head_dim]（无seq_len维度）
-            q = q.squeeze(0)
+            q = q.squeeze(0)  # [num_heads, head_dim]
             k = k.contiguous()
             v = v.contiguous()
             if return_lse:
@@ -230,12 +181,11 @@ class GPUKVCache:
                 )
             else:
                 output = single_decode_with_kv_cache(q=q, k=k, v=v, kv_layout="HND")
-            # output: [num_heads, head_dim]
             output = output.unsqueeze(0).unsqueeze(1)
-            # output: [1, 1, num_heads, head_dim]
+            # output: [num_heads, head_dim] -> [1, 1, num_heads, head_dim]
             if lse is not None:
                 lse = lse.unsqueeze(0).unsqueeze(-1)
-                # lse: [num_heads] → [1, num_heads, 1]
+                # lse: [num_heads] -> [1, num_heads, 1]
 
         return output, lse
 
@@ -252,8 +202,8 @@ class GPUKVCache:
             self.valid_mask[:] = True
 
     def get_seq_len(self, layer_idx: int, batch_idx: int = 0) -> int:
-        return int(self.seq_lens[batch_idx][layer_idx].item())
+        return int(self.seq_lens[batch_idx, layer_idx])
 
     def get_num_valid_tokens(self, layer_idx: int, batch_idx: int = 0) -> int:
         seq_len = self.get_seq_len(layer_idx, batch_idx)
-        return int(self.valid_mask[batch_idx, layer_idx, :seq_len].sum().item())
+        return int(self.valid_mask[batch_idx, layer_idx, :seq_len].sum())

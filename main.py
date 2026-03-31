@@ -70,8 +70,9 @@ class MyCustomModel(ModelAPI):
         # Implement your model invocation logic here
         # For example: API calls, local model inference, etc.
 
+        max_new_tokens = getattr(config, "max_tokens", None) or 512
         inputs = self.tokenizer(input_text, return_tensors="pt").to(self.model.device)
-        response_ids = self.model.generate(**inputs, max_new_tokens=32768)[0][
+        response_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)[0][
             len(inputs.input_ids[0]) :
         ].tolist()
         response = self.tokenizer.decode(response_ids, skip_special_tokens=True)
