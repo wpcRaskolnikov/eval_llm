@@ -65,10 +65,6 @@ class HierarchicalIndex:
             ef_search=self.ef_search,
         )
         self.indices[key] = index
-        logger.debug(
-            f"Built index for layer {layer_idx}, head {head_idx}: "
-            f"{len(token_indices)} tokens, {index.get_num_buckets()} buckets"
-        )
 
     def search(
         self,

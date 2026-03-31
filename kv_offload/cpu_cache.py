@@ -1,9 +1,17 @@
 import logging
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LayerCache:
+    key_cache: torch.Tensor  # [num_kv_heads, num_tokens, head_dim]
+    value_cache: torch.Tensor  # [num_kv_heads, num_tokens, head_dim]
+    token_indices: torch.Tensor  # [num_tokens]
 
 
 class CPUKVCache:
@@ -21,10 +29,8 @@ class CPUKVCache:
         self.dtype = dtype
         self.pin_memory = pin_memory
 
-        # 存储结构: {batch_idx: {layer_idx: {"keys": tensor, "values": tensor, "token_indices": tensor}}}
-        # keys/values: [num_kv_heads, num_offloaded_tokens, head_dim]
-        # token_indices: [num_offloaded_tokens] 原始位置索引
-        self.storage: Dict[int, Dict[int, Dict[str, torch.Tensor]]] = {}
+        # {batch_idx: {layer_idx: LayerCache}}
+        self.storage: Dict[int, Dict[int, LayerCache]] = {}
 
         logger.info(
             f"CPUKVCache initialized: {num_layers} layers, "
@@ -39,15 +45,6 @@ class CPUKVCache:
         token_indices: torch.Tensor,
         batch_idx: int = 0,
     ):
-        """
-        存储offloaded的KV到CPU
-        Args:
-            keys: [num_kv_heads, num_tokens, head_dim] 在GPU上
-            values: [num_kv_heads, num_tokens, head_dim] 在GPU上
-            token_indices: [num_tokens] 这些KV对应的原始token位置
-            batch_idx: batch索引
-        """
-        # 转到CPU并使用pin_memory加速后续传输
         keys_cpu = keys.cpu()
         values_cpu = values.cpu()
         token_indices_cpu = token_indices.cpu()
@@ -57,77 +54,31 @@ class CPUKVCache:
             values_cpu = values_cpu.pin_memory()
             token_indices_cpu = token_indices_cpu.pin_memory()
 
-        # 转换为指定dtype以节省内存
         if keys_cpu.dtype != self.dtype:
             keys_cpu = keys_cpu.to(self.dtype)
             values_cpu = values_cpu.to(self.dtype)
 
-        self.storage.setdefault(batch_idx, {})[layer_idx] = {
-            "keys": keys_cpu,
-            "values": values_cpu,
-            "token_indices": token_indices_cpu,
-        }
-
-        logger.debug(
-            f"Stored {keys.size(1)} tokens to CPU cache for layer {layer_idx}, "
-            f"batch {batch_idx}"
+        self.storage.setdefault(batch_idx, {})[layer_idx] = LayerCache(
+            key_cache=keys_cpu,
+            value_cache=values_cpu,
+            token_indices=token_indices_cpu,
         )
 
     def get(
         self, layer_idx: int, batch_idx: int = 0
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        获取该层所有offloaded的KV
-        Returns:
-            keys: [num_kv_heads, num_tokens, head_dim] 在CPU上
-            values: [num_kv_heads, num_tokens, head_dim] 在CPU上
-            token_indices: [num_tokens] token位置
-        """
-        if batch_idx not in self.storage or layer_idx not in self.storage[batch_idx]:
-            # 返回空tensor
-            empty = torch.empty(self.num_kv_heads, 0, self.head_dim, dtype=self.dtype)
-            empty_indices = torch.empty(0, dtype=torch.long)
-            return empty, empty, empty_indices
-
         data = self.storage[batch_idx][layer_idx]
-        return data["keys"], data["values"], data["token_indices"]
+        return data.key_cache, data.value_cache, data.token_indices
 
-    def get_subset(
+    def get_by_indices(
         self,
         layer_idx: int,
         retrieve_indices: torch.Tensor,
         batch_idx: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        获取指定token indices的KV
-        Args:
-            retrieve_indices: [num_retrieve] 要检索的token位置（原始位置）
-        Returns:
-            keys: [num_kv_heads, num_retrieve, head_dim]
-            values: [num_kv_heads, num_retrieve, head_dim]
-        """
-        if (
-            batch_idx not in self.storage
-            or layer_idx not in self.storage[batch_idx]
-            or len(retrieve_indices) == 0
-        ):
-            empty = torch.empty(self.num_kv_heads, 0, self.head_dim, dtype=self.dtype)
-            return empty, empty
-
         data = self.storage[batch_idx][layer_idx]
-        stored_indices = data["token_indices"]
-
-        # stored_indices 已经是升序排列的
-        positions = torch.searchsorted(stored_indices, retrieve_indices)
-
-        if len(positions) == 0:
-            empty = torch.empty(self.num_kv_heads, 0, self.head_dim, dtype=self.dtype)
-            return empty, empty
-
-        keys = data["keys"][:, positions, :]
-        values = data["values"][:, positions, :]
-
-        return keys, values
+        positions = torch.searchsorted(data.token_indices, retrieve_indices)
+        return data.key_cache[:, positions, :], data.value_cache[:, positions, :]
 
     def has_data(self, batch_idx: int = 0) -> bool:
         return batch_idx in self.storage
@@ -135,7 +86,7 @@ class CPUKVCache:
     def get_num_tokens(self, batch_idx: int = 0) -> int:
         if batch_idx not in self.storage:
             return 0
-        return next(iter(self.storage[batch_idx].values()))["keys"].size(1)
+        return next(iter(self.storage[batch_idx].values())).key_cache.size(1)
 
     def clear(self, batch_idx: Optional[int] = None):
         if batch_idx is not None:
@@ -147,9 +98,11 @@ class CPUKVCache:
         total_bytes = 0
         for layers in self.storage.values():
             for data in layers.values():
-                total_bytes += data["keys"].element_size() * data["keys"].numel()
-                total_bytes += data["values"].element_size() * data["values"].numel()
+                total_bytes += data.key_cache.element_size() * data.key_cache.numel()
                 total_bytes += (
-                    data["token_indices"].element_size() * data["token_indices"].numel()
+                    data.value_cache.element_size() * data.value_cache.numel()
+                )
+                total_bytes += (
+                    data.token_indices.element_size() * data.token_indices.numel()
                 )
         return total_bytes / (1024 * 1024)

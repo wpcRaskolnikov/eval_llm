@@ -1,5 +1,5 @@
 import logging
-from typing import Optional
+from typing import Literal, Optional, Tuple, overload
 
 import torch
 from flashinfer import single_decode_with_kv_cache, single_prefill_with_kv_cache
@@ -26,10 +26,18 @@ class GPUKVCache:
         self.dtype = dtype
         self.device = device
 
-        # 为每一层创建cache [batch, 2, num_layers, heads, seq, dim]
-        self.cache = torch.zeros(
+        # [batch, num_layers, num_kv_heads, max_seq_len, head_dim]
+        self.key_cache = torch.zeros(
             max_batch_size,
-            2,  # 0=key, 1=value
+            num_layers,
+            num_kv_heads,
+            max_seq_len,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        self.value_cache = torch.zeros(
+            max_batch_size,
             num_layers,
             num_kv_heads,
             max_seq_len,
@@ -76,11 +84,11 @@ class GPUKVCache:
         current_len = self.seq_lens[batch_idx][layer_idx].item()
 
         # 写入新的KV到cache
-        self.cache[
-            batch_idx, 0, layer_idx, :, current_len : current_len + seq_len, :
+        self.key_cache[
+            batch_idx, layer_idx, :, current_len : current_len + seq_len, :
         ] = key_states[0]
-        self.cache[
-            batch_idx, 1, layer_idx, :, current_len : current_len + seq_len, :
+        self.value_cache[
+            batch_idx, layer_idx, :, current_len : current_len + seq_len, :
         ] = value_states[0]
 
         # 标记这些位置为有效
@@ -93,8 +101,10 @@ class GPUKVCache:
         self.seq_lens[batch_idx][layer_idx] = new_len
 
         # 返回完整的KV，保留batch维度
-        full_key = self.cache[batch_idx : batch_idx + 1, 0, layer_idx, :, :new_len, :]
-        full_value = self.cache[batch_idx : batch_idx + 1, 1, layer_idx, :, :new_len, :]
+        full_key = self.key_cache[batch_idx : batch_idx + 1, layer_idx, :, :new_len, :]
+        full_value = self.value_cache[
+            batch_idx : batch_idx + 1, layer_idx, :, :new_len, :
+        ]
 
         return full_key, full_value
 
@@ -107,8 +117,8 @@ class GPUKVCache:
             key, value: [1, num_kv_heads, seq_len, head_dim]
         """
         seq_len = self.seq_lens[batch_idx][layer_idx].item()
-        key = self.cache[batch_idx : batch_idx + 1, 0, layer_idx, :, :seq_len, :]
-        value = self.cache[batch_idx : batch_idx + 1, 1, layer_idx, :, :seq_len, :]
+        key = self.key_cache[batch_idx : batch_idx + 1, layer_idx, :, :seq_len, :]
+        value = self.value_cache[batch_idx : batch_idx + 1, layer_idx, :, :seq_len, :]
         return key, value
 
     def get_valid_kv(
@@ -126,10 +136,10 @@ class GPUKVCache:
         valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
 
         # 提取有效的KV
-        key = self.cache[
-            batch_idx, 0, layer_idx, :, valid_indices, :
+        key = self.key_cache[
+            batch_idx, layer_idx, :, valid_indices, :
         ]  # [heads, valid_len, dim]
-        value = self.cache[batch_idx, 1, layer_idx, :, valid_indices, :]
+        value = self.value_cache[batch_idx, layer_idx, :, valid_indices, :]
 
         # 添加batch维度
         key = key.unsqueeze(0)  # [1, heads, valid_len, dim]
@@ -147,18 +157,35 @@ class GPUKVCache:
         """
         token_indices = token_indices.to(self.device)
         self.valid_mask[batch_idx, layer_idx, token_indices] = False
-        logger.debug(
-            f"Layer {layer_idx}: Marked {len(token_indices)} tokens as offloaded"
-        )
+
+    @overload
+    def compute_attention(
+        self,
+        layer_idx: int,
+        query: torch.Tensor,
+        return_lse: Literal[True],
+        is_prefill: bool = ...,
+        batch_idx: int = ...,
+    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
+
+    @overload
+    def compute_attention(
+        self,
+        layer_idx: int,
+        query: torch.Tensor,
+        return_lse: Literal[False] = ...,
+        is_prefill: bool = ...,
+        batch_idx: int = ...,
+    ) -> Tuple[torch.Tensor, None]: ...
 
     def compute_attention(
         self,
         layer_idx: int,
         query: torch.Tensor,
+        return_lse: bool = False,
         is_prefill: bool = False,
         batch_idx: int = 0,
-        return_lse: bool = False,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
             layer_idx: 层索引
@@ -215,11 +242,13 @@ class GPUKVCache:
     def clear(self, batch_idx: Optional[int] = None):
         if batch_idx is not None:
             self.seq_lens[batch_idx] = 0
-            self.cache[batch_idx, :, :, :, :, :] = 0
+            self.key_cache[batch_idx] = 0
+            self.value_cache[batch_idx] = 0
             self.valid_mask[batch_idx, :, :] = True
         else:
             self.seq_lens[:] = 0
-            self.cache[:] = 0
+            self.key_cache[:] = 0
+            self.value_cache[:] = 0
             self.valid_mask[:] = True
 
     def get_seq_len(self, layer_idx: int, batch_idx: int = 0) -> int:

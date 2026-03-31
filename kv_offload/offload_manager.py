@@ -203,11 +203,6 @@ class HybridKVCacheManager:
                     batch_idx=batch_idx,
                 )
 
-            logger.debug(
-                f"Layer {layer_idx}: Offloaded {num_offload}/{seq_len} tokens "
-                f"({num_offload / seq_len * 100:.1f}%)"
-            )
-
         self.is_offloaded = True
         cpu_memory = self.cpu_cache.get_memory_usage_mb()
         logger.info(f"Offload completed. CPU cache size: {cpu_memory:.2f} MB")
@@ -252,7 +247,7 @@ class HybridKVCacheManager:
         # lse_gpu: [1, num_q_heads, 1]
 
         # 2. CPU端：每个KV head独立检索top-k token并计算per-head attention
-        o_cpu, lse_cpu = self.retriever.retrieve_and_compute(
+        cpu_result = self.retriever.retrieve_and_compute(
             layer_idx=layer_idx,
             query=query,
             num_q_heads=num_q_heads,
@@ -260,12 +255,13 @@ class HybridKVCacheManager:
             device=self.device,
             head_dim=self.head_dim,
         )
-        # o_cpu:   [1, 1, num_q_heads, head_dim]  or None
-        # lse_cpu: [1, num_q_heads, 1]             or None
+        # cpu_result: (o_cpu, lse_cpu) 或 None
 
-        if o_cpu is None:
+        if cpu_result is None:
             # CPU cache 无数据，直接返回GPU结果
             return o_gpu
+
+        o_cpu, lse_cpu = cpu_result
 
         # 3. 用 LSE 方法合并 GPU 和 CPU 两部分的 attention 结果
         # flashinfer.merge_state 需要 [seq_len, num_heads, head_dim] / [seq_len, num_heads]

@@ -6,11 +6,11 @@ from typing import Optional, Tuple
 
 import torch
 
-# log2(e)：用于将自然对数 lse 转换为 log2-base lse，与 flashinfer 对齐
-_LOG2E = math.log2(math.e)
-
 from .cpu_cache import CPUKVCache
 from .indexer import HierarchicalIndex
+
+# log2(e)：用于将自然对数 lse 转换为 log2-base lse，与 flashinfer 对齐
+_LOG2E = math.log2(math.e)
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +105,7 @@ class KVRetriever:
         )
 
         # 从CPU cache获取这些tokens的KV
-        keys_cpu, values_cpu = self.cpu_cache.get_subset(
+        keys_cpu, values_cpu = self.cpu_cache.get_by_indices(
             layer_idx, retrieve_indices, batch_idx
         )
         # keys_cpu: [num_kv_heads, num_retrieved, head_dim]
@@ -130,11 +130,6 @@ class KVRetriever:
         if num_q_heads != num_kv_heads:
             keys_gpu = keys_gpu.repeat(1, n_rep, 1, 1)
             values_gpu = values_gpu.repeat(1, n_rep, 1, 1)
-
-        logger.debug(
-            f"Retrieved {keys_gpu.size(2)} tokens for layer {layer_idx} "
-            f"(from {len(all_token_indices)} unique indices across all heads)"
-        )
 
         return keys_gpu, values_gpu
 
@@ -180,11 +175,11 @@ class KVRetriever:
         layer_idx: int,
         query: torch.Tensor,
         num_q_heads: int,
+        device: torch.device,
+        head_dim: int,
         batch_idx: int = 0,
-        device: torch.device = None,
-        head_dim: int = 64,
         use_log2_lse: bool = True,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """
         所有 KV head 检索到的 token 取并集，每个 head 在并集上计算 attention。
 
@@ -197,30 +192,18 @@ class KVRetriever:
                           的 merge_state 保持一致；若 False，返回自然对数 base 的 lse。
 
         Returns:
-            o_cpu:   [1, 1, num_q_heads, head_dim]  在GPU上
-            lse_cpu: [1, num_q_heads, 1]             float32，在GPU上
-            两者均为 None 若 CPU cache 无数据
+            (o_cpu, lse_cpu) 若 CPU cache 有数据：
+                o_cpu:   [1, 1, num_q_heads, head_dim]  在GPU上
+                lse_cpu: [1, num_q_heads, 1]             float32，在GPU上
+            None 若 CPU cache 无数据
         """
         if not self.cpu_cache.has_data(batch_idx):
-            return None, None
+            return None
 
         num_kv_heads = self.cpu_cache.num_kv_heads
         n_rep = num_q_heads // num_kv_heads
-        if device is None:
-            device = query.device
 
-        # 一次性取出该层所有CPU上的KV
-        # keys_all: [num_kv_heads, num_stored, head_dim]  on CPU
-        # stored_indices: [num_stored]  token原始位置
-        keys_all, values_all, stored_indices = self.cpu_cache.get(layer_idx, batch_idx)
-
-        if keys_all.size(1) == 0:
-            return None, None
-
-        num_stored = stored_indices.size(0)
         scale = 1.0 / (head_dim**0.5)
-
-        pos_map: dict = {int(stored_indices[i].item()): i for i in range(num_stored)}
 
         # ---- 第一遍：所有 kv_head 检索结果取并集 ----
         all_token_positions: set = set()
@@ -239,21 +222,14 @@ class KVRetriever:
             all_token_positions.update(top_k_positions.tolist())
 
         if len(all_token_positions) == 0:
-            return None, None
+            return None
 
-        # 映射到存储下标（升序，与 stored_indices 对齐）
-        storage_pos = sorted(pos_map[p] for p in all_token_positions if p in pos_map)
-        if len(storage_pos) == 0:
-            return None, None
-
-        storage_pos_t = torch.tensor(storage_pos, dtype=torch.long)
-
-        # ---- 第二遍：batched attention，所有 head 并行计算 ----
-        # keys_union/values_union: [num_kv_heads, num_union, head_dim] -> GPU
-        keys_union = keys_all[:, storage_pos_t, :].to(dtype=query.dtype, device=device)
-        values_union = values_all[:, storage_pos_t, :].to(
-            dtype=query.dtype, device=device
+        retrieve_indices = torch.tensor(sorted(all_token_positions), dtype=torch.long)
+        keys_union, values_union = self.cpu_cache.get_by_indices(
+            layer_idx, retrieve_indices, batch_idx
         )
+        keys_union = keys_union.to(dtype=query.dtype, device=device)
+        values_union = values_union.to(dtype=query.dtype, device=device)
 
         # GQA 扩展: [num_kv_heads, ...] -> [num_q_heads, ...]
         if n_rep > 1:
@@ -283,11 +259,6 @@ class KVRetriever:
         o_cpu = out.unsqueeze(0).unsqueeze(1)
         # lse_cpu: [1, num_q_heads, 1]
         lse_cpu = lse.unsqueeze(0).unsqueeze(-1)
-
-        logger.debug(
-            f"Layer {layer_idx}: union CPU attention, "
-            f"{len(storage_pos)} tokens, o_cpu shape={o_cpu.shape}"
-        )
 
         return o_cpu, lse_cpu
 
