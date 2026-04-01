@@ -1,8 +1,12 @@
 import logging
+import math
 from typing import Literal, Optional
 
 import flashinfer
 import torch
+
+# log2(e): converts natural log LSE to log2 base, aligning with flashinfer.merge_state
+_LOG2E = math.log2(math.e)
 
 from .cpu_cache import CPUKVCache
 from .gpu_cache import GPUKVCache
@@ -248,25 +252,40 @@ class HybridKVCacheManager:
         # o_gpu:   [1, 1, num_q_heads, head_dim]
         # lse_gpu: [1, num_q_heads, 1]
 
-        # 2. CPU端：每个KV head独立检索top-k token并计算per-head attention
-        cpu_result = self.retriever.retrieve_and_compute(
+        # 2. CPU: retrieve top-k KV pairs and compute attention
+        keys, values = self.retriever.retrieve(
             layer_idx=layer_idx,
             query=query,
             num_q_heads=num_q_heads,
             batch_idx=batch_idx,
-            device=self.device,
-            head_dim=self.head_dim,
         )
-        # cpu_result: (o_cpu, lse_cpu) 或 None
 
-        if cpu_result is None:
-            # CPU cache 无数据，直接返回GPU结果
+        if keys is None:
             return o_gpu
 
-        o_cpu, lse_cpu = cpu_result
+        # keys/values: [1, num_q_heads, num_retrieved, head_dim]
+        scale = 1.0 / (self.head_dim**0.5)
+        q = query[0, :, 0, :].unsqueeze(1)  # [num_q_heads, 1, head_dim]
+        k = keys[0]  # [num_q_heads, num_retrieved, head_dim]
+        v = values[0]  # [num_q_heads, num_retrieved, head_dim]
 
-        # 3. 用 LSE 方法合并 GPU 和 CPU 两部分的 attention 结果
-        # flashinfer.merge_state 需要 [seq_len, num_heads, head_dim] / [seq_len, num_heads]
+        scores = (
+            torch.bmm(q, k.transpose(1, 2)).squeeze(1) * scale
+        )  # [num_q_heads, num_retrieved]
+        max_s = scores.max(dim=-1, keepdim=True).values
+        exp_shifted = torch.exp(scores - max_s)
+        sum_exp = exp_shifted.sum(dim=-1, keepdim=True)
+        lse = (max_s + torch.log(sum_exp)).squeeze(-1).to(
+            torch.float32
+        ) * _LOG2E  # [num_q_heads]
+
+        attn_w = exp_shifted / sum_exp  # [num_q_heads, num_retrieved]
+        out = torch.bmm(attn_w.unsqueeze(1), v).squeeze(1)  # [num_q_heads, head_dim]
+
+        o_cpu = out.unsqueeze(0).unsqueeze(1)  # [1, 1, num_q_heads, head_dim]
+        lse_cpu = lse.unsqueeze(0).unsqueeze(-1)  # [1, num_q_heads, 1]
+
+        # 3. Merge GPU and CPU attention results via LSE
         o_merged, _ = flashinfer.merge_state(
             o_gpu.squeeze(1),
             lse_gpu.squeeze(2).float(),

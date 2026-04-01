@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Qwen3InferenceConfig:
     model_path: str = "/home/wpc/huggingface/Qwen3-8B"
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "cuda:1" if torch.cuda.is_available() else "cpu"
     dtype: torch.dtype = torch.bfloat16
 
     max_batch_size: int = 1
