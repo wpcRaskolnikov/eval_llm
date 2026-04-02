@@ -412,8 +412,8 @@ def main():
         temperature=0.7,
         top_p=0.9,
         top_k=50,
-        offload_ratio=0.8,
-        top_k_per_head=10,
+        offload_ratio=0.9,
+        top_k_per_head=1,
         offload_strategy="middle",
     )
 

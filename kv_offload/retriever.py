@@ -35,55 +35,62 @@ class KVRetriever:
         query: torch.Tensor,
         num_q_heads: int,
         batch_idx: int = 0,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Retrieve KV pairs similar to the given query from CPU cache.
         Args:
             query: [1, num_q_heads, 1, head_dim]
-            num_q_heads: number of query heads
         Returns:
-            keys:   [1, num_q_heads, num_retrieved, head_dim] on query device, or None
-            values: [1, num_q_heads, num_retrieved, head_dim] on query device, or None
+            (keys, values): [1, num_q_heads, num_retrieved, head_dim] or None
         """
         if not self.cpu_cache.has_data(batch_idx):
-            return None, None
+            return None
 
         if not self.indexer.has_index(layer_idx, batch_idx):
-            return None, None
+            return None
 
         num_kv_heads = self.cpu_cache.num_kv_heads
         n_rep = num_q_heads // num_kv_heads
 
         all_token_indices: set = set()
         for kv_head_idx in range(num_kv_heads):
-            q_vector = query[0, kv_head_idx * n_rep, 0, :].cpu()
-            token_indices = self.indexer.search(
-                layer_idx=layer_idx,
-                head_idx=kv_head_idx,
-                query=q_vector,
-                top_k=self.top_k_per_head,
-                batch_idx=batch_idx,
-            )
-            all_token_indices.update(token_indices.tolist())
+            # # Only use first q_head per group, misses other q_heads' attention patterns
+            # q_vector = query[0, kv_head_idx * n_rep, 0, :].cpu()
+            # token_indices = self.indexer.search(
+            #     layer_idx=layer_idx,
+            #     head_idx=kv_head_idx,
+            #     query=q_vector,
+            #     top_k=self.top_k_per_head,
+            #     batch_idx=batch_idx,
+            # )
+            # all_token_indices.update(token_indices.tolist())
+            for rep_idx in range(n_rep):
+                q_vector = query[0, kv_head_idx * n_rep + rep_idx, 0, :].cpu()
+                token_indices = self.indexer.search(
+                    layer_idx=layer_idx,
+                    head_idx=kv_head_idx,
+                    query=q_vector,
+                    top_k=self.top_k_per_head,
+                    batch_idx=batch_idx,
+                )
+                all_token_indices.update(token_indices.tolist())
 
         if not all_token_indices:
-            return None, None
+            return None
 
         retrieve_indices = torch.tensor(sorted(all_token_indices), dtype=torch.long)
         keys, values = self.cpu_cache.get_by_indices(
             layer_idx, retrieve_indices, batch_idx
-        )
-        # keys: [num_kv_heads, num_retrieved, head_dim]
+        )  # [num_kv_heads, num_retrieved, head_dim]
 
         keys = keys.to(dtype=query.dtype, device=query.device)
         values = values.to(dtype=query.dtype, device=query.device)
 
-        # Expand KV for GQA: [num_kv_heads, ...] -> [num_q_heads, ...]
+        # [num_kv_heads, ...] -> [num_q_heads, ...]
         if n_rep > 1:
             keys = keys.repeat_interleave(n_rep, dim=0)
             values = values.repeat_interleave(n_rep, dim=0)
 
-        # Add batch dimension: [1, num_q_heads, num_retrieved, head_dim]
+        # [1, num_q_heads, num_retrieved, head_dim]
         return keys.unsqueeze(0), values.unsqueeze(0)
 
     def update_top_k(self, new_top_k: int):

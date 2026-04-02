@@ -5,13 +5,13 @@ from typing import Literal, Optional
 import flashinfer
 import torch
 
-# log2(e): converts natural log LSE to log2 base, aligning with flashinfer.merge_state
-_LOG2E = math.log2(math.e)
-
 from .cpu_cache import CPUKVCache
 from .gpu_cache import GPUKVCache
 from .indexer import HierarchicalIndex
 from .retriever import KVRetriever
+
+# log2(e): converts natural log LSE to log2 base, aligning with flashinfer.merge_state
+_LOG2E = math.log2(math.e)
 
 logger = logging.getLogger(__name__)
 
@@ -253,15 +253,17 @@ class HybridKVCacheManager:
         # lse_gpu: [1, num_q_heads, 1]
 
         # 2. CPU: retrieve top-k KV pairs and compute attention
-        keys, values = self.retriever.retrieve(
+        retrieved = self.retriever.retrieve(
             layer_idx=layer_idx,
             query=query,
             num_q_heads=num_q_heads,
             batch_idx=batch_idx,
         )
 
-        if keys is None:
+        if retrieved is None:
             return o_gpu
+
+        keys, values = retrieved
 
         # keys/values: [1, num_q_heads, num_retrieved, head_dim]
         scale = 1.0 / (self.head_dim**0.5)
