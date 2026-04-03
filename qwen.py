@@ -24,10 +24,9 @@ class Qwen3InferenceConfig:
     max_batch_size: int = 1
     max_seq_len: int = 1024
 
-    # KV offload 配置
-    offload_ratio: float = 0.5  # prefill 后 offload 的 token 比例
-    top_k_per_head: int = 32  # decode 时每个 head 检索的 top-k token 数
-    num_norm_buckets: int = 10  # 范数分桶数量
+    offload_ratio: float = 0.5
+    top_k_per_head: int = 8
+    num_norm_buckets: int = 10
     hnsw_M: int = 16
     hnsw_ef_construction: int = 200
     hnsw_ef_search: int = 50
@@ -170,17 +169,14 @@ class Qwen3Inference:
 
         # ---- Prefill：将 KV 写入 GPU cache，用 FlashInfer 做 prefill attention ----
         if is_prefill:
-            self.kv_cache.prefill(layer_idx, key_states, value_states)
-            attn_output, _ = self.kv_cache.gpu_cache.compute_attention(
-                layer_idx=layer_idx,
-                query=query_states,
-                is_prefill=True,
+            attn_output = self.kv_cache.prefill(
+                layer_idx, query_states, key_states, value_states
             )
             # attn_output: [1, seq_len, num_heads, head_dim]
 
         # ---- Decode：更新 GPU cache，做 hybrid attention（GPU local + CPU retrieved）----
         else:
-            self.kv_cache.update_decode(layer_idx, key_states, value_states)
+            self.kv_cache.append_kv(layer_idx, key_states, value_states)
 
             attn_output = self.kv_cache.decode(
                 layer_idx=layer_idx,

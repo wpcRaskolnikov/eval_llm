@@ -25,8 +25,8 @@ class Qwen3KVOffloadModel(ModelAPI):
 
         inference_config = Qwen3InferenceConfig(
             model_path=model_name,
-            offload_ratio=float(model_args.get("offload_ratio", 0.5)),
-            top_k_per_head=int(model_args.get("top_k_per_head", 32)),
+            offload_ratio=float(model_args.get("offload_ratio", 0.6)),
+            top_k_per_head=int(model_args.get("top_k_per_head", 8)),
             offload_strategy=cast(
                 Literal["middle", "random", "first"],
                 model_args.get("offload_strategy", "middle"),
@@ -48,7 +48,7 @@ class Qwen3KVOffloadModel(ModelAPI):
         # 拼接 messages 为单个 prompt 字符串
         prompt = self._process_messages(input)
 
-        max_new_tokens = getattr(config, "max_tokens", None) or 512
+        max_new_tokens = getattr(config, "max_tokens", None) or 8192
 
         response = self.engine.generate(
             prompt=prompt,
@@ -59,7 +59,6 @@ class Qwen3KVOffloadModel(ModelAPI):
         return ModelOutput.from_content(model=self.model_name, content=response)
 
     def _process_messages(self, messages: List[ChatMessage]) -> str:
-        """将 ChatMessage 列表拼接为纯文本 prompt"""
         parts = []
         for message in messages:
             role = getattr(message, "role", "user")
@@ -76,13 +75,11 @@ def main():
     #   high_school_computer_science: 95.0% (100 samples)
     custom_model = Qwen3KVOffloadModel(
         model_name="/home/wpc/huggingface/Qwen3-8B",
-        offload_ratio=0.5,
-        top_k_per_head=32,
+        offload_ratio=0.9,
+        top_k_per_head=1,
         offload_strategy="middle",
-        temperature=1.0,  # 与原测试一致
-        top_p=1.0,  # 与原测试一致
-        top_k=50,
-        max_seq_len=2048,
+        temperature=0,
+        max_seq_len=8192,
     )
 
     task_config = TaskConfig(
