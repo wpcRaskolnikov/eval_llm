@@ -18,3 +18,7 @@ dependencies = [
 
 [[tool.uv.index]]
 url = "https://flashinfer.ai/whl/cu128"
+
+[tool.basedpyright]
+typeCheckingMode = "standard"
+reportPrivateImportUsage = "none"
