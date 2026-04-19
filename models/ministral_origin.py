@@ -4,11 +4,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 from transformers import AutoTokenizer, Mistral3ForConditionalGeneration
 from transformers.models.ministral3.modeling_ministral3 import apply_rotary_pos_emb
 
 from kv_offload.gpu_cache import GPUKVCache
+from models.utils import sample_token
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -180,44 +180,6 @@ class MinstralOriginInference:
 
         return logits
 
-    def _sample_token(
-        self,
-        logits: torch.Tensor,
-        temperature: float,
-        top_p: float,
-        top_k: int,
-    ) -> torch.Tensor:
-        """
-        Args:
-            logits: [batch_size, vocab_size]
-        Returns:
-            token: [batch_size]
-        """
-        if temperature == 0:
-            return torch.argmax(logits, dim=-1)
-
-        logits = logits / temperature
-
-        if top_k is not None and top_k > 0:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            pivot = v[:, -1].unsqueeze(1)
-            logits[logits < pivot] = float("-Inf")
-
-        if top_p is not None and top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[..., 0] = False
-
-            indices_to_remove = sorted_indices_to_remove.scatter(
-                1, sorted_indices, sorted_indices_to_remove
-            )
-            logits[indices_to_remove] = float("-inf")
-
-        probs = F.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1).squeeze(-1)
-
     @torch.no_grad()
     def generate(
         self,
@@ -256,7 +218,7 @@ class MinstralOriginInference:
         logger.info(f"Prefill completed in {prefill_time:.3f}s")
 
         # 第一个生成的 token
-        next_token = self._sample_token(logits[:, -1, :], temperature, top_p, top_k)
+        next_token = sample_token(logits[:, -1, :], temperature, top_p, top_k)
         generated_tokens = [next_token.item()]
 
         stream_printed_len = 0
@@ -269,7 +231,7 @@ class MinstralOriginInference:
         decode_start = time.time()
         for i in range(max_new_tokens - 1):
             logits = self.decode_step(next_token.unsqueeze(-1))
-            next_token = self._sample_token(logits[:, -1, :], temperature, top_p, top_k)
+            next_token = sample_token(logits[:, -1, :], temperature, top_p, top_k)
             generated_tokens.append(next_token.item())
 
             if stream:

@@ -4,10 +4,10 @@ from dataclasses import dataclass
 from typing import Literal, Optional, cast
 
 import torch
-import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen3Config
 
 from kv_offload import HybridKVCacheManager
+from models.utils import apply_rotary_emb, sample_token
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -85,25 +85,6 @@ class Qwen3Inference:
             f"Model loaded: {self.num_layers} layers, {self.num_attention_heads} attention heads, {self.num_kv_heads} KV heads, head_dim={self.head_dim}, hidden_size={self.hidden_size}\nKV offload: ratio={config.offload_ratio}, top_k_per_head={config.top_k_per_head}"
         )
 
-    def apply_rotary_emb(self, q, k, cos, sin, unsqueeze_dim=1):
-        """
-        Args:
-            q: [batch_size, num_heads, seq_len, head_dim]
-            k: [batch_size, num_kv_heads, seq_len, head_dim]
-            cos/sin: [batch_size, seq_len, head_dim]
-        """
-
-        def rotate_half(x):
-            x1 = x[..., : x.shape[-1] // 2]
-            x2 = x[..., x.shape[-1] // 2 :]
-            return torch.cat((-x2, x1), dim=-1)
-
-        cos = cos.unsqueeze(unsqueeze_dim)
-        sin = sin.unsqueeze(unsqueeze_dim)
-        q_embed = (q * cos) + (rotate_half(q) * sin)
-        k_embed = (k * cos) + (rotate_half(k) * sin)
-        return q_embed, k_embed
-
     def _forward_layer(
         self,
         hidden_states: torch.Tensor,
@@ -149,9 +130,7 @@ class Qwen3Inference:
             device=hidden_states.device,
         ).unsqueeze(0)
         cos, sin = self.model.model.rotary_emb(hidden_states, position_ids)
-        query_states, key_states = self.apply_rotary_emb(
-            query_states, key_states, cos, sin
-        )
+        query_states, key_states = apply_rotary_emb(query_states, key_states, cos, sin)
 
         # ---- Prefill：将 KV 写入 GPU cache，用 FlashInfer 做 prefill attention ----
         if is_prefill:
@@ -229,46 +208,6 @@ class Qwen3Inference:
 
         return logits
 
-    def _sample_token(
-        self,
-        logits: torch.Tensor,
-        temperature: float,
-        top_p: float,
-        top_k: int,
-    ) -> torch.Tensor:
-        """
-        Args:
-            logits: [batch_size, vocab_size]
-        Returns:
-            token: [batch_size]
-        """
-        if temperature == 0:
-            return torch.argmax(logits, dim=-1)
-
-        logits = logits / temperature
-
-        if top_k is not None and top_k > 0:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            pivot = v[:, -1].unsqueeze(1)
-            logits[logits < pivot] = float("-Inf")
-
-        if top_p is not None and top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[..., 0] = False
-
-            indices_to_remove = sorted_indices_to_remove.scatter(
-                1, sorted_indices, sorted_indices_to_remove
-            )
-            logits[indices_to_remove] = float("-inf")
-
-        probs = F.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-
-        return next_token.squeeze(-1)
-
     @torch.no_grad()
     def generate(
         self,
@@ -317,7 +256,7 @@ class Qwen3Inference:
 
         # 第一个生成的 token
         next_token_logits = logits[:, -1, :]
-        next_token = self._sample_token(next_token_logits, temperature, top_p, top_k)
+        next_token = sample_token(next_token_logits, temperature, top_p, top_k)
         generated_tokens = [next_token.item()]
 
         if stream:
@@ -334,9 +273,7 @@ class Qwen3Inference:
             logits = self.decode_step(token_input)
 
             next_token_logits = logits[:, -1, :]
-            next_token = self._sample_token(
-                next_token_logits, temperature, top_p, top_k
-            )
+            next_token = sample_token(next_token_logits, temperature, top_p, top_k)
             generated_tokens.append(next_token.item())
 
             if stream:
