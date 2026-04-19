@@ -85,10 +85,6 @@ class Qwen3Inference:
             f"Model loaded: {self.num_layers} layers, {self.num_attention_heads} attention heads, {self.num_kv_heads} KV heads, head_dim={self.head_dim}, hidden_size={self.hidden_size}\nKV offload: ratio={config.offload_ratio}, top_k_per_head={config.top_k_per_head}"
         )
 
-    # ------------------------------------------------------------------
-    # RoPE
-    # ------------------------------------------------------------------
-
     def apply_rotary_emb(self, q, k, cos, sin, unsqueeze_dim=1):
         """
         Args:
@@ -107,10 +103,6 @@ class Qwen3Inference:
         q_embed = (q * cos) + (rotate_half(q) * sin)
         k_embed = (k * cos) + (rotate_half(k) * sin)
         return q_embed, k_embed
-
-    # ------------------------------------------------------------------
-    # 单层前向
-    # ------------------------------------------------------------------
 
     def _forward_layer(
         self,
@@ -200,10 +192,6 @@ class Qwen3Inference:
 
         return hidden_states
 
-    # ------------------------------------------------------------------
-    # Prefill
-    # ------------------------------------------------------------------
-
     def prefill(self, input_ids: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len = input_ids.shape
         logger.info(f"Prefill: processing {seq_len} tokens")
@@ -220,10 +208,6 @@ class Qwen3Inference:
             logits = self.model.lm_head(hidden_states)
 
         return logits
-
-    # ------------------------------------------------------------------
-    # Decode step
-    # ------------------------------------------------------------------
 
     def decode_step(self, token_id: torch.Tensor) -> torch.Tensor:
         """
@@ -244,10 +228,6 @@ class Qwen3Inference:
             logits = self.model.lm_head(hidden_states)
 
         return logits
-
-    # ------------------------------------------------------------------
-    # Sampling
-    # ------------------------------------------------------------------
 
     def _sample_token(
         self,
@@ -289,10 +269,6 @@ class Qwen3Inference:
 
         return next_token.squeeze(-1)
 
-    # ------------------------------------------------------------------
-    # Generate
-    # ------------------------------------------------------------------
-
     @torch.no_grad()
     def generate(
         self,
@@ -320,7 +296,7 @@ class Qwen3Inference:
             return_tensors="pt",
             enable_thinking=False,
         )
-        input_ids = tokenized.input_ids.to(self.device).to(self.device)
+        input_ids = tokenized.input_ids.to(self.device)
 
         logger.info(f"Input: {prompt}")
         logger.info(f"Input tokens: {input_ids.shape[1]}")

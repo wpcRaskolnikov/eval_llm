@@ -1,11 +1,11 @@
 import logging
 import time
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal, Optional, cast
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, Gemma3ForConditionalGeneration
+from transformers import AutoTokenizer, Gemma3ForConditionalGeneration, Gemma3TextConfig
 from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb
 
 from kv_offload import HybridKVCacheManager
@@ -57,7 +57,7 @@ class Gemma3Inference:
         #   model.lm_head               -> Linear
         self.text_model = self.model.model.language_model
 
-        text_cfg = self.model.config.text_config
+        text_cfg = cast(Gemma3TextConfig, self.text_model.config)
         self.num_layers = text_cfg.num_hidden_layers  # 34
         self.num_q_heads = text_cfg.num_attention_heads  # 8
         self.num_kv_heads = text_cfg.num_key_value_heads  # 4
