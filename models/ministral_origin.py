@@ -1,13 +1,14 @@
 import logging
 import time
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, Mistral3ForConditionalGeneration
+from transformers.models.ministral3.modeling_ministral3 import apply_rotary_pos_emb
 
-from kv_offload import HybridKVCacheManager
+from kv_offload.gpu_cache import GPUKVCache
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class MinstralInferenceConfig:
+class MinstralOriginInferenceConfig:
     model_path: str = "/home/wpc/huggingface/Ministral-8B-Instruct"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: torch.dtype = torch.bfloat16
@@ -24,21 +25,13 @@ class MinstralInferenceConfig:
     max_batch_size: int = 1
     max_seq_len: int = 4096
 
-    offload_ratio: float = 0.5
-    top_k_per_head: int = 8
-    num_norm_buckets: int = 10
-    hnsw_M: int = 16
-    hnsw_ef_construction: int = 200
-    hnsw_ef_search: int = 50
-    offload_strategy: Literal["middle", "random", "first"] = "middle"
-
     temperature: float = 0.7
     top_p: float = 0.9
     top_k: int = 50
 
 
-class MinstralInference:
-    def __init__(self, config: MinstralInferenceConfig):
+class MinstralOriginInference:
+    def __init__(self, config: MinstralOriginInferenceConfig):
         self.config = config
         self.device = torch.device(config.device)
 
@@ -54,7 +47,7 @@ class MinstralInference:
         )
         self.model.eval()
 
-        # Ministral3 is a vision-language model; text decoder lives in model.model.language_model
+        # Ministral3 是视觉语言模型，文本解码器在 model.model.language_model
         self.lm = self.model.model.language_model  # Ministral3Model
         text_config = self.lm.config
 
@@ -65,9 +58,8 @@ class MinstralInference:
         )
         self.head_dim = text_config.head_dim
         self.hidden_size = text_config.hidden_size
-        self.vocab_size = text_config.vocab_size
 
-        self.kv_cache = HybridKVCacheManager(
+        self.kv_cache = GPUKVCache(
             num_layers=self.num_layers,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
@@ -75,38 +67,12 @@ class MinstralInference:
             max_seq_len=config.max_seq_len,
             dtype=config.dtype,
             device=self.device,
-            offload_ratio=config.offload_ratio,
-            top_k_per_head=config.top_k_per_head,
-            num_norm_buckets=config.num_norm_buckets,
-            hnsw_M=config.hnsw_M,
-            hnsw_ef_construction=config.hnsw_ef_construction,
-            hnsw_ef_search=config.hnsw_ef_search,
         )
 
         logger.info(
             f"Model loaded: {self.num_layers} layers, {self.num_attention_heads} attention heads, "
-            f"{self.num_kv_heads} KV heads, head_dim={self.head_dim}, hidden_size={self.hidden_size}\n"
-            f"KV offload: ratio={config.offload_ratio}, top_k_per_head={config.top_k_per_head}"
+            f"{self.num_kv_heads} KV heads, head_dim={self.head_dim}, hidden_size={self.hidden_size}"
         )
-
-    def apply_rotary_emb(self, q, k, cos, sin, unsqueeze_dim=1):
-        """
-        Args:
-            q: [batch_size, num_heads, seq_len, head_dim]
-            k: [batch_size, num_kv_heads, seq_len, head_dim]
-            cos/sin: [batch_size, seq_len, head_dim]
-        """
-
-        def rotate_half(x):
-            x1 = x[..., : x.shape[-1] // 2]
-            x2 = x[..., x.shape[-1] // 2 :]
-            return torch.cat((-x2, x1), dim=-1)
-
-        cos = cos.unsqueeze(unsqueeze_dim)
-        sin = sin.unsqueeze(unsqueeze_dim)
-        q_embed = (q * cos) + (rotate_half(q) * sin)
-        k_embed = (k * cos) + (rotate_half(k) * sin)
-        return q_embed, k_embed
 
     def _forward_layer(
         self,
@@ -133,7 +99,7 @@ class MinstralInference:
 
         hidden_shape = (batch_size, seq_len, -1, self.head_dim)
 
-        # Ministral has no q_norm/k_norm unlike Qwen3
+        # Ministral 无 q_norm/k_norm
         query_states = attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         # query_states: [batch, num_heads, seq_len, head_dim]
 
@@ -143,51 +109,37 @@ class MinstralInference:
         value_states = attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         # value_states: [batch, num_kv_heads, seq_len, head_dim]
 
-        # RoPE：position 从当前 cache 长度开始
-        kv_seq_len = self.kv_cache.get_seq_len(layer_idx=layer_idx) + seq_len
+        # RoPE
+        current_len = self.kv_cache.get_seq_len(layer_idx=layer_idx)
         position_ids = torch.arange(
-            kv_seq_len - seq_len,
-            kv_seq_len,
+            current_len,
+            current_len + seq_len,
             dtype=torch.long,
             device=hidden_states.device,
         ).unsqueeze(0)
         cos, sin = self.lm.rotary_emb(hidden_states, position_ids)
-        query_states, key_states = self.apply_rotary_emb(
+        query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin
         )
 
-        if is_prefill:
-            attn_output = self.kv_cache.prefill(
-                layer_idx, query_states, key_states, value_states
-            )
-            # attn_output: [1, seq_len, num_heads, head_dim]
-
-        else:
-            self.kv_cache.append_kv(layer_idx, key_states, value_states)
-
-            attn_output = self.kv_cache.decode(
-                layer_idx=layer_idx,
-                query=query_states,
-                num_q_heads=self.num_attention_heads,
-            )
-            # attn_output: [1, 1, num_heads, head_dim]
+        # 写入 cache，再用 FlashInfer 计算 attention
+        self.kv_cache.update(layer_idx, key_states, value_states)
+        attn_output, _ = self.kv_cache.compute_attention(
+            layer_idx, query_states, is_prefill=is_prefill
+        )
 
         # ---- Reshape 回 [batch, seq_len, hidden_size] ----
         attn_output = attn_output.view(
             batch_size, seq_len, self.num_attention_heads * self.head_dim
         )
 
-        # Output projection
-        attn_output = attn.o_proj(attn_output)
-
-        # Residual
-        hidden_states = residual + attn_output
+        # Output projection + residual
+        hidden_states = residual + attn.o_proj(attn_output)
 
         # MLP
         residual = hidden_states
         hidden_states = layer.post_attention_layernorm(hidden_states)
-        hidden_states = layer.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = residual + layer.mlp(hidden_states)
 
         return hidden_states
 
@@ -264,9 +216,7 @@ class MinstralInference:
             logits[indices_to_remove] = float("-inf")
 
         probs = F.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-
-        return next_token.squeeze(-1)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     @torch.no_grad()
     def generate(
@@ -305,46 +255,27 @@ class MinstralInference:
         prefill_time = time.time() - prefill_start
         logger.info(f"Prefill completed in {prefill_time:.3f}s")
 
-        # ---- KV Offload：prefill 后将中间部分 KV 卸载到 CPU 并建立分层索引 ----
-        if self.config.offload_ratio > 0:
-            offload_start = time.time()
-            self.kv_cache.trigger_offload(strategy=self.config.offload_strategy)
-            offload_time = time.time() - offload_start
-            logger.info(f"KV offload completed in {offload_time:.3f}s")
-            self.kv_cache.print_statistics()
-
         # 第一个生成的 token
-        next_token_logits = logits[:, -1, :]
-        next_token = self._sample_token(next_token_logits, temperature, top_p, top_k)
+        next_token = self._sample_token(logits[:, -1, :], temperature, top_p, top_k)
         generated_tokens = [next_token.item()]
 
+        stream_printed_len = 0
         if stream:
-            print(
-                self.tokenizer.decode([next_token.item()], skip_special_tokens=True),
-                end="",
-                flush=True,
-            )
+            text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            print(text, end="", flush=True)
+            stream_printed_len = len(text)
 
         # ---- Decode loop ----
         decode_start = time.time()
         for i in range(max_new_tokens - 1):
-            token_input = next_token.unsqueeze(-1)
-            logits = self.decode_step(token_input)
-
-            next_token_logits = logits[:, -1, :]
-            next_token = self._sample_token(
-                next_token_logits, temperature, top_p, top_k
-            )
+            logits = self.decode_step(next_token.unsqueeze(-1))
+            next_token = self._sample_token(logits[:, -1, :], temperature, top_p, top_k)
             generated_tokens.append(next_token.item())
 
             if stream:
-                print(
-                    self.tokenizer.decode(
-                        [next_token.item()], skip_special_tokens=True
-                    ),
-                    end="",
-                    flush=True,
-                )
+                text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                print(text[stream_printed_len:], end="", flush=True)
+                stream_printed_len = len(text)
 
             if next_token.item() == self.tokenizer.eos_token_id:
                 logger.info(f"EOS reached at step {i + 1}")
@@ -363,26 +294,19 @@ class MinstralInference:
             f"Decode: {len(generated_tokens)} tokens in {decode_time:.3f}s ({tokens_per_sec:.2f} tokens/s)"
         )
 
-        generated_text = self.tokenizer.decode(
-            generated_tokens, skip_special_tokens=True
-        )
-
-        return generated_text
+        return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
 
 def main():
-    config = MinstralInferenceConfig(
+    config = MinstralOriginInferenceConfig(
         model_path="/home/wpc/huggingface/Ministral-3-8B-Instruct",
         temperature=0.7,
         top_p=0.9,
         top_k=50,
-        offload_ratio=0.9,
-        top_k_per_head=5,
-        offload_strategy="middle",
     )
 
-    logger.info("Initializing Ministral Inference Engine (with KV Offload)")
-    engine = MinstralInference(config)
+    logger.info("Initializing Ministral Origin Inference Engine (pure GPU)")
+    engine = MinstralOriginInference(config)
 
     prompt = "hello"
     with open("prompt.txt", "r") as f:
