@@ -82,15 +82,16 @@ class KVRetriever:
             layer_idx, retrieve_indices, batch_idx
         )  # [num_kv_heads, num_retrieved, head_dim]
 
-        keys = keys.to(dtype=query.dtype, device=query.device)
-        values = values.to(dtype=query.dtype, device=query.device)
+        # Keep on CPU, cast to float32 for stable CPU attention computation
+        keys = keys.to(dtype=torch.float32)
+        values = values.to(dtype=torch.float32)
 
         # [num_kv_heads, ...] -> [num_q_heads, ...]
         if n_rep > 1:
             keys = keys.repeat_interleave(n_rep, dim=0)
             values = values.repeat_interleave(n_rep, dim=0)
 
-        # [1, num_q_heads, num_retrieved, head_dim]
+        # [1, num_q_heads, num_retrieved, head_dim] — stays on CPU
         return keys.unsqueeze(0), values.unsqueeze(0)
 
     def update_top_k(self, new_top_k: int):

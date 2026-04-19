@@ -217,9 +217,12 @@ class HybridKVCacheManager:
 
         keys, values = retrieved
 
-        # keys/values: [1, num_q_heads, num_retrieved, head_dim]
+        # keys/values: [1, num_q_heads, num_retrieved, head_dim] — on CPU, float32
         scale = 1.0 / (self.head_dim**0.5)
-        q = query[0, :, 0, :]  # [num_q_heads, head_dim]
+        # Move only query to CPU for attention computation
+        q = query[0, :, 0, :].to(
+            device="cpu", dtype=torch.float32
+        )  # [num_q_heads, head_dim]
         k = keys[0]  # [num_q_heads, num_retrieved, head_dim]
         v = values[0]  # [num_q_heads, num_retrieved, head_dim]
 
@@ -231,10 +234,17 @@ class HybridKVCacheManager:
         sum_exp = exp_shifted.sum(dim=-1, keepdim=True)  # [num_q_heads, 1]
         attn_w = exp_shifted / sum_exp  # [num_q_heads, num_retrieved]
 
-        o_cpu = torch.einsum("hn,hnd->hd", attn_w, v).unsqueeze(0)
+        # Attention output and LSE computed on CPU, then move small results to GPU
+        o_cpu = (
+            torch.einsum("hn,hnd->hd", attn_w, v)
+            .unsqueeze(0)
+            .to(device=self.device, dtype=o_gpu.dtype, non_blocking=True)
+        )
         lse_cpu = (
-            (max_s + torch.log(sum_exp)).squeeze(-1).to(torch.float32) * _LOG2E
-        ).unsqueeze(0)
+            ((max_s + torch.log(sum_exp)).squeeze(-1) * _LOG2E)
+            .unsqueeze(0)
+            .to(device=self.device, non_blocking=True)
+        )
         # o_cpu: [1, num_q_heads, head_dim]
         # lse_cpu: [1, num_q_heads]
 

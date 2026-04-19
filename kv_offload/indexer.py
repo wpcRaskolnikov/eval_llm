@@ -48,13 +48,16 @@ class LayerHeadIndex:
             bucket_keys: torch.Tensor, bucket_indices: torch.Tensor
         ) -> BucketEntry:
             n = bucket_keys.size(0)
-            index = hnswlib.Index(space="cosine", dim=head_dim)
+            index = hnswlib.Index(space="ip", dim=head_dim)
             index.init_index(max_elements=n, ef_construction=ef_construction, M=M)
             index.set_ef(ef_search)
 
+            keys_np = bucket_keys.float().numpy()
+            keys_np /= np.linalg.norm(keys_np, axis=1, keepdims=True).clip(min=1e-12)
+
             # Pass token positions as ids so knn_query returns token positions directly
             index.add_items(
-                bucket_keys.float().numpy(),
+                keys_np,
                 bucket_indices.numpy().astype(np.int64),
             )
             return BucketEntry(hnsw=index, num_tokens=n)
@@ -75,6 +78,7 @@ class LayerHeadIndex:
             token_indices: [<=top_k]
         """
         query_np = query.cpu().float().unsqueeze(0).numpy()
+        query_np /= np.linalg.norm(query_np, axis=1, keepdims=True).clip(min=1e-12)
         all_labels = []
         all_scores = []
 
@@ -87,8 +91,9 @@ class LayerHeadIndex:
             k = min(k, bucket.num_tokens)
             labels, distances = bucket.hnsw.knn_query(query_np, k=k)
 
-            # Approximate attention score: mid_norm * cos_sim = mid_norm * (1 - cosine_distance)
-            scores = [mid_norm * (1.0 - d) for d in distances[0].tolist()]
+            # Approximate attention score: mid_norm * cos_sim
+            # space="ip" returns inner product (higher = more similar)
+            scores = [mid_norm * d for d in distances[0].tolist()]
             all_labels.extend(labels[0].tolist())
             all_scores.extend(scores)
 
