@@ -1,12 +1,11 @@
 import logging
 import time
 from dataclasses import dataclass
-from typing import Literal, Optional, cast
+from typing import Literal, Optional
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, Gemma3ForConditionalGeneration, Gemma3TextConfig
-from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb
+from transformers import AutoTokenizer, Mistral3ForConditionalGeneration
 
 from kv_offload import HybridKVCacheManager
 
@@ -17,13 +16,13 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class Gemma3InferenceConfig:
-    model_path: str = "/home/wpc/huggingface/gemma-3-4b-it"
-    device: str = "cuda:0" if torch.cuda.is_available() else "cpu"
+class MinstralInferenceConfig:
+    model_path: str = "/home/wpc/huggingface/Ministral-8B-Instruct"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: torch.dtype = torch.bfloat16
 
     max_batch_size: int = 1
-    max_seq_len: int = 1024
+    max_seq_len: int = 4096
 
     offload_ratio: float = 0.5
     top_k_per_head: int = 8
@@ -38,67 +37,38 @@ class Gemma3InferenceConfig:
     top_k: int = 50
 
 
-class Gemma3Inference:
-    def __init__(self, config: Gemma3InferenceConfig):
+class MinstralInference:
+    def __init__(self, config: MinstralInferenceConfig):
         self.config = config
         self.device = torch.device(config.device)
 
         logger.info(f"Loading model from {config.model_path}")
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model_path)
-        self.model = Gemma3ForConditionalGeneration.from_pretrained(
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            config.model_path, trust_remote_code=True
+        )
+        self.model = Mistral3ForConditionalGeneration.from_pretrained(
             config.model_path,
             torch_dtype=config.dtype,
             device_map=config.device,
+            trust_remote_code=True,
         )
         self.model.eval()
 
-        # Gemma3ForConditionalGeneration 结构:
-        #   model.model.language_model  -> Gemma3TextModel
-        #   model.lm_head               -> Linear
-        self.text_model = self.model.model.language_model
+        # Ministral3 is a vision-language model; text decoder lives in model.model.language_model
+        self.lm = self.model.model.language_model  # Ministral3Model
+        text_config = self.lm.config
 
-        text_cfg = cast(Gemma3TextConfig, self.text_model.config)
-        self.num_layers = text_cfg.num_hidden_layers  # 34
-        self.num_q_heads = text_cfg.num_attention_heads  # 8
-        self.num_kv_heads = text_cfg.num_key_value_heads  # 4
-        self.head_dim = text_cfg.head_dim  # 256
-        self.hidden_size = text_cfg.hidden_size
-        self.vocab_size = text_cfg.vocab_size
-        self.layer_types = text_cfg.layer_types  # list[str], len=34
-        self.sliding_window = text_cfg.sliding_window  # 1024
-        self.final_logit_softcapping = getattr(
-            text_cfg, "final_logit_softcapping", None
+        self.num_layers = text_config.num_hidden_layers
+        self.num_attention_heads = text_config.num_attention_heads
+        self.num_kv_heads = getattr(
+            text_config, "num_key_value_heads", self.num_attention_heads
         )
+        self.head_dim = text_config.head_dim
+        self.hidden_size = text_config.hidden_size
+        self.vocab_size = text_config.vocab_size
 
-        # 分别为 sliding / full attention 层建 KV cache manager
-        self.sliding_layers = [
-            i
-            for i in range(self.num_layers)
-            if self.layer_types[i] == "sliding_attention"
-        ]
-        self.full_layers = [
-            i for i in range(self.num_layers) if self.layer_types[i] == "full_attention"
-        ]
-        self.sliding_virt = {a: v for v, a in enumerate(self.sliding_layers)}
-        self.full_virt = {a: v for v, a in enumerate(self.full_layers)}
-
-        self.sliding_kv_cache = HybridKVCacheManager(
-            num_layers=len(self.sliding_layers),
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim,
-            max_batch_size=config.max_batch_size,
-            max_seq_len=config.max_seq_len,
-            dtype=config.dtype,
-            device=self.device,
-            offload_ratio=config.offload_ratio,
-            top_k_per_head=config.top_k_per_head,
-            num_norm_buckets=config.num_norm_buckets,
-            hnsw_M=config.hnsw_M,
-            hnsw_ef_construction=config.hnsw_ef_construction,
-            hnsw_ef_search=config.hnsw_ef_search,
-        )
-        self.full_kv_cache = HybridKVCacheManager(
-            num_layers=len(self.full_layers),
+        self.kv_cache = HybridKVCacheManager(
+            num_layers=self.num_layers,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
             max_batch_size=config.max_batch_size,
@@ -114,8 +84,33 @@ class Gemma3Inference:
         )
 
         logger.info(
-            f"Model loaded: {self.num_layers} layers, {self.num_q_heads} Q-heads, {self.num_kv_heads} KV-heads, head_dim={self.head_dim}\n  sliding layers: {len(self.sliding_layers)}, full layers: {len(self.full_layers)}, sliding_window={self.sliding_window}"
+            f"Model loaded: {self.num_layers} layers, {self.num_attention_heads} attention heads, "
+            f"{self.num_kv_heads} KV heads, head_dim={self.head_dim}, hidden_size={self.hidden_size}\n"
+            f"KV offload: ratio={config.offload_ratio}, top_k_per_head={config.top_k_per_head}"
         )
+
+    # ------------------------------------------------------------------
+    # RoPE
+    # ------------------------------------------------------------------
+
+    def apply_rotary_emb(self, q, k, cos, sin, unsqueeze_dim=1):
+        """
+        Args:
+            q: [batch_size, num_heads, seq_len, head_dim]
+            k: [batch_size, num_kv_heads, seq_len, head_dim]
+            cos/sin: [batch_size, seq_len, head_dim]
+        """
+
+        def rotate_half(x):
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            return torch.cat((-x2, x1), dim=-1)
+
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
 
     # ------------------------------------------------------------------
     # 单层前向
@@ -134,75 +129,74 @@ class Gemma3Inference:
             output: [batch_size, seq_len, hidden_size]
         """
         batch_size, seq_len, _ = hidden_states.shape
-        layer = self.text_model.layers[layer_idx]
-        attn = layer.self_attn
-
-        is_sliding = self.layer_types[layer_idx] == "sliding_attention"
-        ltype = "sliding_attention" if is_sliding else "full_attention"
-        kv_cache = self.sliding_kv_cache if is_sliding else self.full_kv_cache
-        virt = self.sliding_virt[layer_idx] if is_sliding else self.full_virt[layer_idx]
+        layer = self.lm.layers[layer_idx]
 
         residual = hidden_states
 
-        # Pre-attention LayerNorm
+        # Pre-attention RMSNorm
         hidden_states = layer.input_layernorm(hidden_states)
 
         # ---- Self-Attention ----
+        attn = layer.self_attn
+
         hidden_shape = (batch_size, seq_len, -1, self.head_dim)
 
-        query_states = attn.q_norm(attn.q_proj(hidden_states).view(hidden_shape))
-        # query_states: [batch, seq_len, num_q_heads, head_dim]
+        # Ministral has no q_norm/k_norm unlike Qwen3
+        query_states = attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # query_states: [batch, num_heads, seq_len, head_dim]
 
-        key_states = attn.k_norm(attn.k_proj(hidden_states).view(hidden_shape))
-        # key_states: [batch, seq_len, num_kv_heads, head_dim]
+        key_states = attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # key_states: [batch, num_kv_heads, seq_len, head_dim]
 
-        value_states = attn.v_proj(hidden_states).view(hidden_shape)
-        # value_states: [batch, seq_len, num_kv_heads, head_dim]
+        value_states = attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # value_states: [batch, num_kv_heads, seq_len, head_dim]
 
         # RoPE：position 从当前 cache 长度开始
-        cur_len = kv_cache.get_seq_len(virt)
+        kv_seq_len = self.kv_cache.get_seq_len(layer_idx=layer_idx) + seq_len
         position_ids = torch.arange(
-            cur_len, cur_len + seq_len, dtype=torch.long, device=self.device
+            kv_seq_len - seq_len,
+            kv_seq_len,
+            dtype=torch.long,
+            device=hidden_states.device,
         ).unsqueeze(0)
-        cos, sin = self.text_model.rotary_emb(hidden_states, position_ids, ltype)
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin, unsqueeze_dim=2
+        cos, sin = self.lm.rotary_emb(hidden_states, position_ids)
+        query_states, key_states = self.apply_rotary_emb(
+            query_states, key_states, cos, sin
         )
-
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
 
         # ---- Prefill：将 KV 写入 GPU cache，用 FlashInfer 做 prefill attention ----
         if is_prefill:
-            attn_output = kv_cache.prefill(virt, query_states, key_states, value_states)
-            # attn_output: [1, seq_len, num_q_heads, head_dim]
+            attn_output = self.kv_cache.prefill(
+                layer_idx, query_states, key_states, value_states
+            )
+            # attn_output: [1, seq_len, num_heads, head_dim]
 
         # ---- Decode：更新 GPU cache，做 hybrid attention（GPU local + CPU retrieved）----
         else:
-            kv_cache.append_kv(virt, key_states, value_states)
-            attn_output = kv_cache.decode(
-                layer_idx=virt, query=query_states, num_q_heads=self.num_q_heads
+            self.kv_cache.append_kv(layer_idx, key_states, value_states)
+
+            attn_output = self.kv_cache.decode(
+                layer_idx=layer_idx,
+                query=query_states,
+                num_q_heads=self.num_attention_heads,
             )
-            # attn_output: [1, 1, num_q_heads, head_dim]
+            # attn_output: [1, 1, num_heads, head_dim]
 
         # ---- Reshape 回 [batch, seq_len, hidden_size] ----
         attn_output = attn_output.view(
-            batch_size, seq_len, self.num_q_heads * self.head_dim
+            batch_size, seq_len, self.num_attention_heads * self.head_dim
         )
 
         # Output projection
         attn_output = attn.o_proj(attn_output)
 
-        # Residual（Gemma 风格：post_attention_layernorm 作用在 attn 输出上，再加 residual）
-        hidden_states = layer.post_attention_layernorm(attn_output)
-        hidden_states = residual + hidden_states
+        # Residual
+        hidden_states = residual + attn_output
 
         # MLP
         residual = hidden_states
-        hidden_states = layer.pre_feedforward_layernorm(hidden_states)
+        hidden_states = layer.post_attention_layernorm(hidden_states)
         hidden_states = layer.mlp(hidden_states)
-        hidden_states = layer.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
@@ -216,20 +210,15 @@ class Gemma3Inference:
         logger.info(f"Prefill: processing {seq_len} tokens")
 
         with torch.no_grad():
-            hidden_states = self.text_model.embed_tokens(input_ids)
+            hidden_states = self.lm.embed_tokens(input_ids)
 
             for layer_idx in range(self.num_layers):
                 hidden_states = self._forward_layer(
                     hidden_states, layer_idx, is_prefill=True
                 )
 
-            hidden_states = self.text_model.norm(hidden_states)
+            hidden_states = self.lm.norm(hidden_states)
             logits = self.model.lm_head(hidden_states)
-            if self.final_logit_softcapping:
-                logits = (
-                    torch.tanh(logits / self.final_logit_softcapping)
-                    * self.final_logit_softcapping
-                )
 
         return logits
 
@@ -245,20 +234,15 @@ class Gemma3Inference:
             logits: [batch_size, 1, vocab_size]
         """
         with torch.no_grad():
-            hidden_states = self.text_model.embed_tokens(token_id)
+            hidden_states = self.lm.embed_tokens(token_id)
 
             for layer_idx in range(self.num_layers):
                 hidden_states = self._forward_layer(
                     hidden_states, layer_idx, is_prefill=False
                 )
 
-            hidden_states = self.text_model.norm(hidden_states)
+            hidden_states = self.lm.norm(hidden_states)
             logits = self.model.lm_head(hidden_states)
-            if self.final_logit_softcapping:
-                logits = (
-                    torch.tanh(logits / self.final_logit_softcapping)
-                    * self.final_logit_softcapping
-                )
 
         return logits
 
@@ -310,10 +294,6 @@ class Gemma3Inference:
     # Generate
     # ------------------------------------------------------------------
 
-    def clear(self):
-        self.sliding_kv_cache.clear()
-        self.full_kv_cache.clear()
-
     @torch.no_grad()
     def generate(
         self,
@@ -330,8 +310,9 @@ class Gemma3Inference:
         top_p = top_p if top_p is not None else self.config.top_p
         top_k = top_k if top_k is not None else self.config.top_k
 
-        self.clear()
+        self.kv_cache.clear()
 
+        # Tokenize
         messages = [{"role": "user", "content": prompt}]
         tokenized = self.tokenizer.apply_chat_template(
             messages,
@@ -353,12 +334,10 @@ class Gemma3Inference:
         # ---- KV Offload：prefill 后将中间部分 KV 卸载到 CPU 并建立分层索引 ----
         if self.config.offload_ratio > 0:
             offload_start = time.time()
-            self.sliding_kv_cache.trigger_offload(strategy=self.config.offload_strategy)
-            self.full_kv_cache.trigger_offload(strategy=self.config.offload_strategy)
+            self.kv_cache.trigger_offload(strategy=self.config.offload_strategy)
             offload_time = time.time() - offload_start
             logger.info(f"KV offload completed in {offload_time:.3f}s")
-            self.sliding_kv_cache.print_statistics()
-            self.full_kv_cache.print_statistics()
+            self.kv_cache.print_statistics()
 
         # 第一个生成的 token
         next_token_logits = logits[:, -1, :]
@@ -373,10 +352,6 @@ class Gemma3Inference:
             )
 
         # ---- Decode loop ----
-        eos_ids = self.tokenizer.eos_token_id
-        if isinstance(eos_ids, int):
-            eos_ids = [eos_ids]
-
         decode_start = time.time()
         for i in range(max_new_tokens - 1):
             token_input = next_token.unsqueeze(-1)
@@ -397,7 +372,7 @@ class Gemma3Inference:
                     flush=True,
                 )
 
-            if next_token.item() in eos_ids:
+            if next_token.item() == self.tokenizer.eos_token_id:
                 logger.info(f"EOS reached at step {i + 1}")
                 break
 
@@ -422,8 +397,8 @@ class Gemma3Inference:
 
 
 def main():
-    config = Gemma3InferenceConfig(
-        model_path="/home/wpc/huggingface/gemma-3-4b-it",
+    config = MinstralInferenceConfig(
+        model_path="/home/wpc/huggingface/Ministral-8B-Instruct",
         temperature=0.7,
         top_p=0.9,
         top_k=50,
@@ -432,8 +407,8 @@ def main():
         offload_strategy="middle",
     )
 
-    logger.info("Initializing Gemma3 Inference Engine (with KV Offload)")
-    engine = Gemma3Inference(config)
+    logger.info("Initializing Ministral Inference Engine (with KV Offload)")
+    engine = MinstralInference(config)
 
     prompt = "hello"
     with open("prompt.txt", "r") as f:
